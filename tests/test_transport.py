@@ -42,6 +42,11 @@ class FakeConnection:
         pass
 
 
+class BrokenSendConnection(FakeConnection):
+    def request(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+        raise BrokenPipeError("stale keep-alive")
+
+
 class TransportTest(unittest.TestCase):
     def test_first_output_is_recorded_while_reading_stream(self) -> None:
         client = StreamingHttpClient()
@@ -63,6 +68,24 @@ class TransportTest(unittest.TestCase):
         self.assertEqual(result.end_ms, 60.0)
         self.assertEqual(result.chunk_arrival_ms, [20.0, 30.0])
         self.assertEqual(result.usage["completion_tokens"], 2)
+
+    def test_reused_stale_connection_retries_once_before_response(self) -> None:
+        client = StreamingHttpClient("reuse")
+        connections = iter((BrokenSendConnection(), FakeConnection()))
+        with (
+            patch.object(client, "_connection", side_effect=connections),
+            patch.object(client, "_discard_connection"),
+        ):
+            result = client.post(
+                "http://example.test/v1/chat/completions",
+                {"messages": [], "stream": True},
+                {},
+                10,
+                False,
+            )
+
+        self.assertIsNone(result.error)
+        self.assertEqual(result.retry_count, 1)
 
 
 if __name__ == "__main__":

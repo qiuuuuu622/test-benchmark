@@ -44,7 +44,7 @@ uv pip install --python ~/qwen35-benchmark/.venv-benchmark/bin/python -e .
 uv pip install \
   --python ~/qwen35-benchmark/.venv-benchmark/bin/python \
   --no-deps \
-  dist/endpoint_benchmark-0.1.0-py3-none-any.whl
+  dist/endpoint_benchmark-0.1.1-py3-none-any.whl
 ```
 
 ## 2. 下载 Qwen3.5-4B
@@ -161,7 +161,10 @@ cd ~/qwen35-benchmark
   --warmup-prompts 4 \
   --max-output-tokens-cap 128 \
   --ignore-eos \
-  --connection-mode new \
+  --connection-mode reuse \
+  --preflight-tokenize \
+  --max-model-len 32768 \
+  --min-success-rate 1.0 \
   --no-server-metrics \
   --output-dir ./results \
   --label qwen35-4b-single-gpu
@@ -175,7 +178,10 @@ cd ~/qwen35-benchmark
 - `--warmup-prompts 4`：正式计时前发送 4 条预热请求。
 - `--max-output-tokens-cap 128`：限制单条请求最多生成 128 tokens，适合先做烟测。
 - `--ignore-eos`：忽略模型提前输出 EOS，尽量生成到设定上限，使吞吐对比更稳定。
-- `--connection-mode new`：每个请求建立新连接，适合当前版本的可靠性验证。
+- `--connection-mode reuse`：每个 worker 复用连接；检测到尚未收到响应前的失效 keep-alive socket 时，会重建连接并安全重试一次。
+- `--preflight-tokenize`：正式压测前调用第一个 endpoint 的 `/tokenize`，获得每条数据的真实输入 token 数。
+- `--max-model-len 32768`：preflight 使用的上下文上限。发现输入与输出之和超限时直接停止，不发送正式 workload。
+- `--min-success-rate 1.0`：要求每档请求 100% 成功。结果仍会写入磁盘，但不达标时命令返回退出码 3。
 - `--no-server-metrics`：不读取 vLLM `/metrics`，但不会关闭客户端 TTFT、TPOT、E2E、request/s 或 token/s 统计。
 
 输出目录会自动带时间戳，例如：
@@ -188,7 +194,10 @@ results/qwen35-4b-single-gpu_20260806_120000/
 
 - `summary.csv`：每个并发档位一行的汇总指标。
 - `summary.json`：JSON 格式的汇总结果。
+- `endpoint_summary.csv`：按 endpoint 拆分的成功率、延迟和吞吐诊断；不替代池级 summary。
+- `endpoint_summary.json`：JSON 格式的 endpoint 诊断结果。
 - `requests.jsonl`：每条请求的成功状态、endpoint、TTFT、TPOT 和 E2E 等原始结果。
+- `preflight.json`：启用 tokenize preflight 时的数据 token 分布和上下文检查结果。
 - `cache_resets.json`：每次 prefix-cache 清理的审计记录。
 - `run.json`：完整运行配置和数据集告警。
 
@@ -210,7 +219,10 @@ results/qwen35-4b-single-gpu_20260806_120000/
   --warmup-prompts 4 \
   --max-output-tokens-cap 128 \
   --ignore-eos \
-  --connection-mode new \
+  --connection-mode reuse \
+  --preflight-tokenize \
+  --max-model-len 32768 \
+  --min-success-rate 1.0 \
   --no-server-metrics \
   --output-dir ./results \
   --label qwen35-4b-four-endpoints
@@ -248,23 +260,23 @@ TPOT = (请求结束时间 - 首个输出时间) / (输出 token 数 - 1)
 
 单位是 `ms/token`，越低越好。它反映持续解码速度，但它是单个请求解码阶段的平均值，不等于相邻 token 间隔的逐 token 分布。只有输出 token 数至少为 2 时，该请求才有有效 TPOT。
 
-### ITL：Inter-Token Latency
+### Inter-chunk latency 与 ITL
 
-ITL 是流式输出中，相邻两个有效输出 token 或 chunk 的到达时间差：
+严格的 ITL 是流式输出中相邻两个 token 的到达时间差。OpenAI SSE chunk 不保证严格等于一个 token，因此本工具使用更准确的名称 `inter_chunk_latency_ms`：
 
 ```text
-ITL[i] = 第 i 个输出到达时间 - 第 i-1 个输出到达时间
+inter_chunk_latency[i] = 第 i 个有效 chunk 到达时间 - 第 i-1 个有效 chunk 到达时间
 ```
 
-ITL 描述输出是否平滑。平均 TPOT 可能很好，但如果少数 token 停顿很久，ITL P95/P99 会暴露这种卡顿。
+该指标描述流式输出是否平滑。平均 TPOT 可能很好，但如果少数 chunk 停顿很久，P95/P99 会暴露这种卡顿。`summary.csv` 默认包含 `inter_chunk_latency_ms_mean/p95/p99`。
 
-当前版本默认不保存每个 chunk 的到达时间。加入下面的参数后，原始到达偏移会写入 `requests.jsonl` 的 `chunk_arrival_offsets_ms`：
+汇总指标始终计算；加入下面的参数后，还会把原始到达偏移写入 `requests.jsonl` 的 `chunk_arrival_offsets_ms`：
 
 ```bash
 --record-chunk-timestamps
 ```
 
-需要注意：SSE chunk 不一定严格等于一个 token。当前汇总 CSV 提供 TPOT，但还没有直接提供 ITL mean/P95/P99；ITL 聚合需要根据原始 chunk 时间进一步计算。
+逐请求结果还包含 `inter_chunk_latencies_ms`，便于进一步分析流式卡顿。不要在报告中把它写成严格 token 级 ITL，除非目标服务能够保证一个有效 SSE chunk 恰好对应一个 token。
 
 ### E2E Latency：完整请求延迟
 

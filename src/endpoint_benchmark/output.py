@@ -21,12 +21,20 @@ def write_result(result: BenchmarkResult) -> None:
         directory / "run.json",
         {
             "run": result.run,
+            "valid": result.valid,
+            "preflight": result.preflight,
             "cache_resets": result.cache_resets_by_concurrency,
             "warnings": result.warnings,
         },
     )
     _write_json(directory / "summary.json", result.summaries)
     _write_summary_csv(directory / "summary.csv", result.summaries)
+    _write_json(directory / "endpoint_summary.json", result.endpoint_summaries)
+    _write_endpoint_summary_csv(
+        directory / "endpoint_summary.csv", result.endpoint_summaries
+    )
+    if result.preflight is not None:
+        _write_json(directory / "preflight.json", result.preflight)
 
     with (directory / "requests.jsonl").open("w", encoding="utf-8") as handle:
         for concurrency, requests in result.requests_by_concurrency.items():
@@ -101,6 +109,12 @@ def _write_summary_csv(path: Path, summaries: list[dict[str, Any]]) -> None:
         "tpot_ms_mean",
         "tpot_ms_p95",
         "tpot_ms_p99",
+        "inter_chunk_latency_ms_mean",
+        "inter_chunk_latency_ms_p95",
+        "inter_chunk_latency_ms_p99",
+        "transport_retries",
+        "success_rate",
+        "valid",
         "acceptance_rate",
     ]
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -133,6 +147,65 @@ def _write_summary_csv(path: Path, summaries: list[dict[str, Any]]) -> None:
                     "tpot_ms_mean": summary["tpot_ms"]["mean"],
                     "tpot_ms_p95": summary["tpot_ms"]["p95"],
                     "tpot_ms_p99": summary["tpot_ms"]["p99"],
+                    "inter_chunk_latency_ms_mean": summary[
+                        "inter_chunk_latency_ms"
+                    ]["mean"],
+                    "inter_chunk_latency_ms_p95": summary[
+                        "inter_chunk_latency_ms"
+                    ]["p95"],
+                    "inter_chunk_latency_ms_p99": summary[
+                        "inter_chunk_latency_ms"
+                    ]["p99"],
+                    "transport_retries": summary["transport_retries"],
+                    "success_rate": summary["success_rate"],
+                    "valid": summary["valid"],
                     "acceptance_rate": server_metrics.get("acceptance_rate"),
+                }
+            )
+
+
+def _write_endpoint_summary_csv(
+    path: Path, summaries: list[dict[str, Any]]
+) -> None:
+    fields = [
+        "concurrency",
+        "endpoint_index",
+        "endpoint",
+        "successful_requests",
+        "requested_requests",
+        "success_rate",
+        "requests_per_second",
+        "output_tokens_per_second",
+        "e2e_latency_ms_p95",
+        "ttft_ms_p95",
+        "tpot_ms_p95",
+        "inter_chunk_latency_ms_p95",
+        "transport_retries",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for summary in summaries:
+            writer.writerow(
+                {
+                    "concurrency": summary["concurrency"],
+                    "endpoint_index": summary["endpoint_index"],
+                    "endpoint": summary["endpoint"],
+                    "successful_requests": summary["successful_requests"],
+                    "requested_requests": summary["requested_requests"],
+                    "success_rate": summary["success_rate"],
+                    "requests_per_second": summary["throughput"][
+                        "requests_per_second"
+                    ],
+                    "output_tokens_per_second": summary["throughput"][
+                        "output_tokens_per_second"
+                    ],
+                    "e2e_latency_ms_p95": summary["e2e_latency_ms"]["p95"],
+                    "ttft_ms_p95": summary["ttft_ms"]["p95"],
+                    "tpot_ms_p95": summary["tpot_ms"]["p95"],
+                    "inter_chunk_latency_ms_p95": summary[
+                        "inter_chunk_latency_ms"
+                    ]["p95"],
+                    "transport_retries": summary["transport_retries"],
                 }
             )

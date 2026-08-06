@@ -166,6 +166,7 @@ class RunnerTest(unittest.TestCase):
                 )
                 self.assertEqual(summary["ttft_ms"]["samples"], 4)
                 self.assertEqual(summary["tpot_ms"]["samples"], 4)
+                self.assertEqual(summary["inter_chunk_latency_ms"]["samples"], 4)
                 self.assertTrue(summary["throughput"]["token_counts_complete"])
                 self.assertEqual(server.reset_count, 3)
                 self.assertEqual(
@@ -180,11 +181,18 @@ class RunnerTest(unittest.TestCase):
                 self.assertTrue(run_output.name.startswith("benchmark_"))
                 self.assertTrue((run_output / "summary.json").is_file())
                 self.assertTrue((run_output / "cache_resets.json").is_file())
+                self.assertTrue((run_output / "endpoint_summary.csv").is_file())
+                self.assertTrue((run_output / "endpoint_summary.json").is_file())
                 with (run_output / "summary.csv").open(
                     newline="", encoding="utf-8"
                 ) as handle:
                     csv_row = next(csv.DictReader(handle))
-                for metric in ("e2e_latency_ms", "ttft_ms", "tpot_ms"):
+                for metric in (
+                    "e2e_latency_ms",
+                    "ttft_ms",
+                    "tpot_ms",
+                    "inter_chunk_latency_ms",
+                ):
                     for statistic in ("mean", "p95", "p99"):
                         self.assertIn(f"{metric}_{statistic}", csv_row)
                 self.assertEqual(

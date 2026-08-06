@@ -8,6 +8,8 @@ from endpoint_benchmark.models import (
     MeasurementConfig,
     OutputConfig,
     PrefixCacheResetConfig,
+    PreflightConfig,
+    ValidityConfig,
     WorkloadConfig,
 )
 from endpoint_benchmark.runner import run_benchmark
@@ -20,8 +22,10 @@ __all__ = [
     "LoadConfig",
     "MeasurementConfig",
     "OutputConfig",
+    "PreflightConfig",
     "PrefixCacheResetConfig",
     "WorkloadConfig",
+    "ValidityConfig",
     "__version__",
     "run_benchmark",
 ]

@@ -17,6 +17,7 @@ def summarize_requests(
     duration_s: float,
     dispatch_count: dict[str, int],
     server_metrics: dict[str, Any] | None,
+    min_success_rate: float = 1.0,
 ) -> dict[str, Any]:
     """Calculate one summary from the unified request measurement pool."""
     successful = [result for result in results if result.success]
@@ -37,6 +38,8 @@ def summarize_requests(
     input_total = sum(input_tokens) if token_counts_complete else None
     output_total = sum(output_tokens) if token_counts_complete else None
 
+    success_rate = len(successful) / len(results) if results else None
+    valid = success_rate is not None and success_rate >= min_success_rate
     return {
         "concurrency": concurrency,
         "requested_requests": requested,
@@ -47,7 +50,9 @@ def summarize_requests(
             result.error is not None and result.error.get("type") == "timeout"
             for result in failed
         ),
-        "success_rate": len(successful) / len(results) if results else None,
+        "success_rate": success_rate,
+        "min_success_rate": min_success_rate,
+        "valid": valid,
         "benchmark_duration_s": duration_s,
         "throughput": {
             "requests_per_second": len(successful) / duration_s if duration_s else None,
@@ -79,6 +84,12 @@ def summarize_requests(
         "tpot_ms": distribution(
             result.tpot_ms for result in successful if result.tpot_ms is not None
         ),
+        "inter_chunk_latency_ms": distribution(
+            latency
+            for result in successful
+            for latency in result.inter_chunk_latencies_ms
+        ),
+        "transport_retries": sum(result.transport_retries for result in results),
         "routing": {
             "policy": "round_robin",
             "dispatch_count": dispatch_count,
@@ -86,6 +97,34 @@ def summarize_requests(
         "errors": _error_counts(failed),
         "server_metrics": server_metrics,
     }
+
+
+def summarize_endpoints(
+    concurrency: int,
+    endpoints: tuple[str, ...],
+    results: list[RequestResult],
+    duration_s: float,
+    min_success_rate: float,
+) -> list[dict[str, Any]]:
+    """Return diagnostics per endpoint without changing pool-level semantics."""
+    summaries: list[dict[str, Any]] = []
+    for endpoint_index, endpoint in enumerate(endpoints):
+        endpoint_results = [
+            result for result in results if result.endpoint_index == endpoint_index
+        ]
+        summary = summarize_requests(
+            concurrency=concurrency,
+            requested=len(endpoint_results),
+            results=endpoint_results,
+            duration_s=duration_s,
+            dispatch_count={f"endpoint-{endpoint_index}": len(endpoint_results)},
+            server_metrics=None,
+            min_success_rate=min_success_rate,
+        )
+        summary["endpoint_index"] = endpoint_index
+        summary["endpoint"] = endpoint
+        summaries.append(summary)
+    return summaries
 
 
 def distribution(values: Iterable[float | int]) -> dict[str, float | int | None]:

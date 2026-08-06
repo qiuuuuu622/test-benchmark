@@ -15,6 +15,8 @@ from endpoint_benchmark.models import (
     MeasurementConfig,
     OutputConfig,
     PrefixCacheResetConfig,
+    PreflightConfig,
+    ValidityConfig,
     WorkloadConfig,
 )
 from endpoint_benchmark.runner import run_benchmark
@@ -35,6 +37,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     _print_summaries(result.summaries)
     print(f"Saved results to {result.output_directory.resolve()}")
+    if not result.valid and config.validity.fail_on_request_error:
+        print(
+            "error: benchmark is invalid because one or more concurrency "
+            "levels missed the minimum success rate",
+            file=sys.stderr,
+        )
+        return 3
     return 0
 
 
@@ -67,6 +76,14 @@ def _parser() -> argparse.ArgumentParser:
     metrics.add_argument("--metrics-url")
     metrics.add_argument("--no-server-metrics", action="store_true")
     run.add_argument("--record-chunk-timestamps", action="store_true")
+    run.add_argument("--preflight-tokenize", action="store_true")
+    run.add_argument("--max-model-len", type=int)
+    run.add_argument("--min-success-rate", type=float, default=1.0)
+    run.add_argument(
+        "--fail-on-request-error",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     run.add_argument(
         "--reset-prefix-cache",
         action=argparse.BooleanOptionalAction,
@@ -113,6 +130,14 @@ def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
             server_metrics_enabled=not args.no_server_metrics,
             record_chunk_timestamps=args.record_chunk_timestamps,
         ),
+        preflight=PreflightConfig(
+            tokenize=args.preflight_tokenize or args.max_model_len is not None,
+            max_model_len=args.max_model_len,
+        ),
+        validity=ValidityConfig(
+            min_success_rate=args.min_success_rate,
+            fail_on_request_error=args.fail_on_request_error,
+        ),
         prefix_cache_reset=PrefixCacheResetConfig(
             enabled=args.reset_prefix_cache,
             timeout_s=args.prefix_cache_reset_timeout,
@@ -157,6 +182,7 @@ def _print_summaries(summaries: list[dict[str, Any]]) -> None:
         "e2e_p95",
         "ttft_p95",
         "tpot_p95",
+        "icl_p95",
         "acc_rate",
     )
     rows: list[tuple[str, ...]] = []
@@ -174,6 +200,7 @@ def _print_summaries(summaries: list[dict[str, Any]]) -> None:
                 _format(summary["e2e_latency_ms"]["p95"]),
                 _format(summary["ttft_ms"]["p95"]),
                 _format(summary["tpot_ms"]["p95"]),
+                _format(summary["inter_chunk_latency_ms"]["p95"]),
                 _format(server_metrics.get("acceptance_rate"), 3),
             )
         )

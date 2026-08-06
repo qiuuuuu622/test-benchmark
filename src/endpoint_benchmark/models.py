@@ -91,6 +91,30 @@ class MeasurementConfig:
 
 
 @dataclass(frozen=True)
+class PreflightConfig:
+    """Optional server-side dataset token validation."""
+
+    tokenize: bool = False
+    max_model_len: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_model_len is not None and self.max_model_len <= 0:
+            raise ValueError("max_model_len must be positive")
+
+
+@dataclass(frozen=True)
+class ValidityConfig:
+    """Rules deciding whether completed benchmark results are valid."""
+
+    min_success_rate: float = 1.0
+    fail_on_request_error: bool = True
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.min_success_rate <= 1.0:
+            raise ValueError("min_success_rate must be between 0 and 1")
+
+
+@dataclass(frozen=True)
 class PrefixCacheResetConfig:
     """Prefix-cache reset lifecycle configuration."""
 
@@ -124,6 +148,8 @@ class BenchmarkConfig:
     workload: WorkloadConfig
     load: LoadConfig
     measurement: MeasurementConfig = field(default_factory=MeasurementConfig)
+    preflight: PreflightConfig = field(default_factory=PreflightConfig)
+    validity: ValidityConfig = field(default_factory=ValidityConfig)
     prefix_cache_reset: PrefixCacheResetConfig = field(
         default_factory=PrefixCacheResetConfig
     )
@@ -158,6 +184,8 @@ class RequestResult:
     started_at_offset_ms: float
     finished_at_offset_ms: float
     finish_reason: str | None
+    transport_retries: int = 0
+    inter_chunk_latencies_ms: list[float] = field(default_factory=list)
     chunk_arrival_offsets_ms: list[float] | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -171,8 +199,11 @@ class BenchmarkResult:
 
     run: dict[str, Any]
     summaries: list[dict[str, Any]]
+    endpoint_summaries: list[dict[str, Any]]
     requests_by_concurrency: dict[int, list[RequestResult]]
     server_metrics_by_concurrency: dict[int, dict[str, Any] | None]
     cache_resets_by_concurrency: dict[int, list[dict[str, Any]]]
     warnings: list[str]
     output_directory: Path
+    valid: bool = True
+    preflight: dict[str, Any] | None = None

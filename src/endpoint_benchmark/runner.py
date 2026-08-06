@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
-from endpoint_benchmark.aggregation import summarize_requests
+from endpoint_benchmark.aggregation import summarize_endpoints, summarize_requests
 from endpoint_benchmark.cache_control import reset_prefix_caches
 from endpoint_benchmark.dataset import load_dataset
 from endpoint_benchmark.models import (
@@ -19,6 +19,7 @@ from endpoint_benchmark.models import (
     RequestResult,
 )
 from endpoint_benchmark.output import resolve_output_directory, write_result
+from endpoint_benchmark.preflight import run_token_preflight
 from endpoint_benchmark.routing import RoundRobinRouter
 from endpoint_benchmark.server_metrics import (
     MetricsSnapshot,
@@ -33,6 +34,9 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     """Run all configured concurrency levels and write their results."""
     output_directory = resolve_output_directory(config.output)
     cases, warnings = load_dataset(config.workload.dataset, config.load)
+    preflight = None
+    if config.preflight.tokenize:
+        preflight = run_token_preflight(config, cases, _request_headers(config))
     startup_cache_reset = None
     if config.prefix_cache_reset.enabled:
         startup_cache_reset = _reset_prefix_cache(
@@ -44,12 +48,22 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     metrics_by_concurrency: dict[int, dict[str, Any] | None] = {}
     cache_resets_by_concurrency: dict[int, list[dict[str, Any]]] = {}
     summaries: list[dict[str, Any]] = []
+    endpoint_summaries: list[dict[str, Any]] = []
 
     for concurrency in config.load.concurrency:
         summary, results, metrics, cache_resets, run_warnings = _run_concurrency(
             config, concurrency, cases
         )
         summaries.append(summary)
+        endpoint_summaries.extend(
+            summarize_endpoints(
+                concurrency=concurrency,
+                endpoints=config.endpoint_pool.endpoints,
+                results=results,
+                duration_s=summary["benchmark_duration_s"],
+                min_success_rate=config.validity.min_success_rate,
+            )
+        )
         requests_by_concurrency[concurrency] = results
         metrics_by_concurrency[concurrency] = metrics
         cache_resets_by_concurrency[concurrency] = cache_resets
@@ -61,11 +75,14 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     result = BenchmarkResult(
         run=_run_metadata(config, cases),
         summaries=summaries,
+        endpoint_summaries=endpoint_summaries,
         requests_by_concurrency=requests_by_concurrency,
         server_metrics_by_concurrency=metrics_by_concurrency,
         cache_resets_by_concurrency=cache_resets_by_concurrency,
         warnings=list(dict.fromkeys(warnings)),
         output_directory=output_directory,
+        valid=all(summary["valid"] for summary in summaries),
+        preflight=preflight,
     )
     write_result(result)
     return result
@@ -137,6 +154,7 @@ def _run_concurrency(
         duration_s=duration_s,
         dispatch_count=router.dispatch_count,
         server_metrics=server_metrics,
+        min_success_rate=config.validity.min_success_rate,
     )
     return summary, results, server_metrics, cache_resets, warnings
 
@@ -211,6 +229,14 @@ def _execute_case(
         arrivals = [
             timestamp - transport.start_ms for timestamp in transport.chunk_arrival_ms
         ]
+    inter_chunk_latencies = [
+        current - previous
+        for previous, current in zip(
+            transport.chunk_arrival_ms,
+            transport.chunk_arrival_ms[1:],
+            strict=False,
+        )
+    ]
     return RequestResult(
         request_id=case.request_id,
         index=index,
@@ -226,6 +252,8 @@ def _execute_case(
         started_at_offset_ms=transport.start_ms - benchmark_start_ms,
         finished_at_offset_ms=transport.end_ms - benchmark_start_ms,
         finish_reason=transport.finish_reason,
+        transport_retries=transport.retry_count,
+        inter_chunk_latencies_ms=inter_chunk_latencies,
         chunk_arrival_offsets_ms=arrivals,
     )
 
@@ -408,6 +436,10 @@ def _redacted_configuration(config: BenchmarkConfig) -> dict[str, Any]:
         "metrics_url_source": _metrics_url_source(config),
         "server_metrics_enabled": config.measurement.server_metrics_enabled,
         "record_chunk_timestamps": config.measurement.record_chunk_timestamps,
+        "preflight_tokenize": config.preflight.tokenize,
+        "preflight_max_model_len": config.preflight.max_model_len,
+        "min_success_rate": config.validity.min_success_rate,
+        "fail_on_request_error": config.validity.fail_on_request_error,
         "prefix_cache_reset_enabled": config.prefix_cache_reset.enabled,
         "prefix_cache_reset_timeout_s": config.prefix_cache_reset.timeout_s,
         "prefix_cache_reset_retry_interval_s": (

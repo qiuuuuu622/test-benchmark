@@ -29,6 +29,7 @@ class TransportResult:
     usage: dict[str, Any] | None
     finish_reason: str | None
     chunk_arrival_ms: list[float]
+    retry_count: int = 0
 
 
 class StreamingHttpClient:
@@ -49,6 +50,7 @@ class StreamingHttpClient:
         record_chunk_timestamps: bool,
     ) -> TransportResult:
         """Send one request and record observable streaming events."""
+        del record_chunk_timestamps
         parsed = urlsplit(endpoint)
         start_ms = now_ms()
         first_output_ms: float | None = None
@@ -57,21 +59,20 @@ class StreamingHttpClient:
         arrivals: list[float] = []
         saw_done = False
         connection: http.client.HTTPConnection | None = None
+        retry_count = 0
         try:
-            connection = self._connection(parsed, timeout_s)
             request_headers = {
                 "Accept": "text/event-stream",
                 "Content-Type": "application/json",
                 **headers,
             }
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            connection.request(
-                "POST",
-                _request_target(parsed),
+            connection, response, retry_count = self._send_request(
+                parsed=parsed,
                 body=body,
                 headers=request_headers,
+                timeout_s=timeout_s,
             )
-            response = connection.getresponse()
             if response.status != 200:
                 message = response.read(2000).decode("utf-8", errors="replace")
                 self._discard_connection(parsed)
@@ -84,6 +85,7 @@ class StreamingHttpClient:
                     usage=None,
                     finish_reason=None,
                     chunk_arrival_ms=[],
+                    retry_count=retry_count,
                 )
 
             while True:
@@ -112,6 +114,7 @@ class StreamingHttpClient:
                         usage=usage,
                         finish_reason=finish_reason,
                         chunk_arrival_ms=arrivals,
+                        retry_count=retry_count,
                     )
                 if chunk.get("usage") is not None:
                     usage = chunk["usage"]
@@ -124,8 +127,7 @@ class StreamingHttpClient:
                     if delta.get("content") or delta.get("tool_calls"):
                         if first_output_ms is None:
                             first_output_ms = received_ms
-                        if record_chunk_timestamps:
-                            arrivals.append(received_ms)
+                        arrivals.append(received_ms)
 
             error = None
             if not saw_done:
@@ -143,16 +145,47 @@ class StreamingHttpClient:
                 usage=usage,
                 finish_reason=finish_reason,
                 chunk_arrival_ms=arrivals,
+                retry_count=retry_count,
             )
         except TimeoutError as exc:
             self._discard_connection(parsed)
-            return _transport_error("timeout", exc, start_ms)
+            return _transport_error("timeout", exc, start_ms, retry_count)
         except (OSError, http.client.HTTPException) as exc:
             self._discard_connection(parsed)
-            return _transport_error("connection", exc, start_ms)
+            return _transport_error("connection", exc, start_ms, retry_count)
         finally:
             if self._connection_mode == "new" and connection is not None:
                 connection.close()
+
+    def _send_request(
+        self,
+        parsed: SplitResult,
+        body: bytes,
+        headers: dict[str, str],
+        timeout_s: float,
+    ) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse, int]:
+        """Send once, reconnecting one stale reused socket before response."""
+        retryable = (
+            BrokenPipeError,
+            ConnectionResetError,
+            http.client.CannotSendRequest,
+        )
+        for attempt in range(2):
+            connection = self._connection(parsed, timeout_s)
+            try:
+                connection.request(
+                    "POST",
+                    _request_target(parsed),
+                    body=body,
+                    headers=headers,
+                )
+            except retryable:
+                self._discard_connection(parsed)
+                if self._connection_mode != "reuse" or attempt == 1:
+                    raise
+                continue
+            return connection, connection.getresponse(), attempt
+        raise AssertionError("unreachable")
 
     def close(self) -> None:
         """Close all connections created by this client."""
@@ -222,6 +255,7 @@ def _transport_error(
     error_type: str,
     exc: BaseException,
     start_ms: float,
+    retry_count: int = 0,
 ) -> TransportResult:
     return TransportResult(
         status_code=None,
@@ -232,4 +266,5 @@ def _transport_error(
         usage=None,
         finish_reason=None,
         chunk_arrival_ms=[],
+        retry_count=retry_count,
     )
