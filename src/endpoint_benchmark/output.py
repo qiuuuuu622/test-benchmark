@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 from endpoint_benchmark.models import BenchmarkResult, OutputConfig
@@ -27,8 +31,7 @@ def write_result(result: BenchmarkResult) -> None:
             "warnings": result.warnings,
         },
     )
-    _write_json(directory / "summary.json", result.summaries)
-    _write_summary_csv(directory / "summary.csv", result.summaries)
+    write_summary_snapshot(directory, result.summaries)
     _write_json(directory / "endpoint_summary.json", result.endpoint_summaries)
     _write_endpoint_summary_csv(
         directory / "endpoint_summary.csv", result.endpoint_summaries
@@ -50,6 +53,16 @@ def write_result(result: BenchmarkResult) -> None:
         directory / "cache_resets.json",
         result.cache_resets_by_concurrency,
     )
+
+
+def write_summary_snapshot(
+    directory: Path, summaries: list[dict[str, Any]]
+) -> None:
+    """Atomically replace the cumulative summary files."""
+    with _atomic_path(directory / "summary.json") as path:
+        _write_json(path, summaries)
+    with _atomic_path(directory / "summary.csv") as path:
+        _write_summary_csv(path, summaries)
 
 
 def resolve_output_directory(config: OutputConfig) -> Path:
@@ -82,6 +95,19 @@ def _safe_name(value: str) -> str:
             "label or run name must contain at least one filename-safe character"
         )
     return name
+
+
+@contextmanager
+def _atomic_path(path: Path) -> Iterator[Path]:
+    with NamedTemporaryFile(
+        dir=path.parent, prefix=f".{path.name}.", delete=False
+    ) as handle:
+        temporary = Path(handle.name)
+    try:
+        yield temporary
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _write_json(path: Path, value: Any) -> None:
