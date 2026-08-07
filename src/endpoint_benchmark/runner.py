@@ -18,7 +18,11 @@ from endpoint_benchmark.models import (
     RequestCase,
     RequestResult,
 )
-from endpoint_benchmark.output import resolve_output_directory, write_result
+from endpoint_benchmark.output import (
+    resolve_output_directory,
+    write_result,
+    write_summary_snapshot,
+)
 from endpoint_benchmark.preflight import run_token_preflight
 from endpoint_benchmark.routing import RoundRobinRouter
 from endpoint_benchmark.server_metrics import (
@@ -33,6 +37,8 @@ from endpoint_benchmark.version import __version__
 def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     """Run all configured concurrency levels and write their results."""
     output_directory = resolve_output_directory(config.output)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    print(f"Output directory: {output_directory.resolve()}", flush=True)
     cases, warnings = load_dataset(config.workload.dataset, config.load)
     preflight = None
     if config.preflight.tokenize:
@@ -55,6 +61,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
             config, concurrency, cases
         )
         summaries.append(summary)
+        write_summary_snapshot(output_directory, summaries)
         endpoint_summaries.extend(
             summarize_endpoints(
                 concurrency=concurrency,

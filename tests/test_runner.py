@@ -1,19 +1,24 @@
 from __future__ import annotations
 
+import contextlib
 import csv
+import io
 import json
 import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
+from endpoint_benchmark.aggregation import summarize_requests
 from endpoint_benchmark.models import (
     BenchmarkConfig,
     EndpointPoolConfig,
     LoadConfig,
     MeasurementConfig,
     OutputConfig,
+    PrefixCacheResetConfig,
     RequestCase,
     WorkloadConfig,
 )
@@ -67,6 +72,62 @@ class Handler(BaseHTTPRequestHandler):
 
 
 class RunnerTest(unittest.TestCase):
+    def test_preserves_completed_summary_when_later_concurrency_fails(self) -> None:
+        summary = summarize_requests(1, 0, [], 1.0, {}, None)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "results" / "incremental"
+            config = BenchmarkConfig(
+                endpoint_pool=EndpointPoolConfig(
+                    endpoints=("http://example.test/v1",)
+                ),
+                workload=WorkloadConfig(dataset=Path("unused.jsonl")),
+                load=LoadConfig(concurrency=(1, 2)),
+                prefix_cache_reset=PrefixCacheResetConfig(enabled=False),
+                output=OutputConfig(
+                    directory=output.parent,
+                    run_name=output.name,
+                ),
+            )
+
+            def run_concurrency(*args: object) -> tuple[object, ...]:
+                concurrency = args[-2]
+                self.assertTrue(output.is_dir())
+                if concurrency == 1:
+                    return summary, [], None, [], []
+                self.assertEqual(
+                    json.loads((output / "summary.json").read_text()),
+                    [summary],
+                )
+                with (output / "summary.csv").open(
+                    newline="", encoding="utf-8"
+                ) as handle:
+                    self.assertEqual(
+                        [row["concurrency"] for row in csv.DictReader(handle)],
+                        ["1"],
+                    )
+                raise RuntimeError("second concurrency failed")
+
+            stdout = io.StringIO()
+            with (
+                patch(
+                    "endpoint_benchmark.runner.load_dataset",
+                    return_value=([], []),
+                ),
+                patch(
+                    "endpoint_benchmark.runner._run_concurrency",
+                    side_effect=run_concurrency,
+                ),
+                contextlib.redirect_stdout(stdout),
+                self.assertRaisesRegex(RuntimeError, "second concurrency failed"),
+            ):
+                run_benchmark(config)
+
+            self.assertIn(str(output.resolve()), stdout.getvalue())
+            self.assertEqual(
+                json.loads((output / "summary.json").read_text()),
+                [summary],
+            )
+
     def test_metrics_url_defaults_to_first_endpoint_origin(self) -> None:
         config = BenchmarkConfig(
             endpoint_pool=EndpointPoolConfig(
