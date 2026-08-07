@@ -4,6 +4,7 @@ import contextlib
 import csv
 import io
 import json
+import re
 import tempfile
 import threading
 import unittest
@@ -19,6 +20,7 @@ from endpoint_benchmark.models import (
     MeasurementConfig,
     OutputConfig,
     PrefixCacheResetConfig,
+    PreflightConfig,
     RequestCase,
     WorkloadConfig,
 )
@@ -35,10 +37,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802
         length = int(self.headers["Content-Length"])
-        self.rfile.read(length)
+        raw_body = self.rfile.read(length)
         if self.path.startswith("/reset_prefix_cache"):
             self.server.reset_count += 1
-            body = b'{"success": true}'
+            body = b""
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -46,6 +48,8 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             self.wfile.flush()
             return
+        self.server.request_count += 1
+        self.server.request_bodies.append(json.loads(raw_body))
         chunks = [
             {"choices": [{"delta": {"role": "assistant"}}]},
             {"choices": [{"delta": {"content": "hello"}}]},
@@ -184,6 +188,8 @@ class RunnerTest(unittest.TestCase):
     def test_runs_endpoint_pool_and_writes_results(self) -> None:
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         server.reset_count = 0
+        server.request_count = 0
+        server.request_bodies = []
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
@@ -230,6 +236,13 @@ class RunnerTest(unittest.TestCase):
                 self.assertEqual(summary["inter_chunk_latency_ms"]["samples"], 4)
                 self.assertTrue(summary["throughput"]["token_counts_complete"])
                 self.assertEqual(server.reset_count, 3)
+                self.assertEqual(server.request_count, 4)
+                self.assertEqual(
+                    sorted(
+                        body["messages"][0]["content"] for body in server.request_bodies
+                    ),
+                    [f"prompt {index}" for index in range(4)],
+                )
                 self.assertEqual(
                     [
                         item["phase"]
@@ -260,6 +273,175 @@ class RunnerTest(unittest.TestCase):
                     len((run_output / "requests.jsonl").read_text().splitlines()),
                     4,
                 )
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_isolated_miss_is_unique_across_warmup_and_concurrency_levels(
+        self,
+    ) -> None:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.reset_count = 0
+        server.request_count = 0
+        server.request_bodies = []
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                dataset = root / "workload.jsonl"
+                original = (
+                    '{"id":"same","messages":'
+                    '[{"role":"user","content":"hello"}]}\n'
+                )
+                dataset.write_text(original, encoding="utf-8")
+                endpoint = f"http://127.0.0.1:{server.server_port}/v1/chat/completions"
+                config = BenchmarkConfig(
+                    endpoint_pool=EndpointPoolConfig(endpoints=(endpoint,)),
+                    workload=WorkloadConfig(dataset=dataset, model="test"),
+                    load=LoadConfig(concurrency=(1, 2), warmup_prompts=1),
+                    measurement=MeasurementConfig(server_metrics_enabled=False),
+                    isolated_miss=True,
+                    output=OutputConfig(directory=root / "results"),
+                )
+
+                result = run_benchmark(config)
+
+                identities = []
+                for body in server.request_bodies:
+                    self.assertNotIn("cache_salt", body)
+                    match = re.fullmatch(
+                        r"\[rid:([0-9a-f]{16})\]\n\nhello",
+                        body["messages"][0]["content"],
+                    )
+                    self.assertIsNotNone(match)
+                    identities.append(match.group(1))
+                self.assertEqual(len(identities), 4)
+                self.assertEqual(len(set(identities)), 4)
+                self.assertEqual(server.reset_count, 0)
+                self.assertEqual(result.cache_resets_by_concurrency, {1: [], 2: []})
+                self.assertEqual(result.run["cache_mode"], "isolated_miss")
+                self.assertEqual(result.run["text_strategy"], "system_prefix")
+                self.assertEqual(result.run["media_strategy"], "none")
+                self.assertFalse(
+                    result.run["configuration"]["prefix_cache_reset_enabled"]
+                )
+                metadata = json.dumps(result.run)
+                for forbidden in ("cache_salt", "probe", "discovery"):
+                    self.assertNotIn(forbidden, metadata)
+                self.assertEqual(dataset.read_text(encoding="utf-8"), original)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
+
+    def test_isolated_miss_rejects_invalid_media_before_network_io(self) -> None:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.reset_count = 0
+        server.request_count = 0
+        server.request_bodies = []
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                endpoint = f"http://127.0.0.1:{server.server_port}/v1/chat/completions"
+                invalid_rows = {
+                    "missing": [
+                        {
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "image_url",
+                                            "image_url": {
+                                                "url": "http://media.test/a.png"
+                                            },
+                                        }
+                                    ],
+                                }
+                            ]
+                        }
+                    ],
+                    "mixed": [
+                        {
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "image_url",
+                                            "image_url": {
+                                                "url": "data:image/png;base64,AAAA"
+                                            },
+                                            "uuid": "{isolated_miss_id}",
+                                        }
+                                    ],
+                                }
+                            ]
+                        },
+                        {
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "image_url",
+                                            "image_url": {
+                                                "url": "http://media.test/"
+                                                "{isolated_miss_id}/b.png"
+                                            },
+                                        }
+                                    ],
+                                }
+                            ]
+                        },
+                    ],
+                    "unsupported": [
+                        {
+                            "messages": [
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "input_audio",
+                                            "input_audio": {"data": "AAAA"},
+                                        }
+                                    ],
+                                }
+                            ]
+                        }
+                    ],
+                }
+
+                for name, rows in invalid_rows.items():
+                    with self.subTest(name=name):
+                        server.reset_count = 0
+                        server.request_count = 0
+                        server.request_bodies.clear()
+                        dataset = root / f"{name}.jsonl"
+                        dataset.write_text(
+                            "\n".join(json.dumps(row) for row in rows) + "\n",
+                            encoding="utf-8",
+                        )
+                        config = BenchmarkConfig(
+                            endpoint_pool=EndpointPoolConfig(endpoints=(endpoint,)),
+                            workload=WorkloadConfig(dataset=dataset, model="test"),
+                            load=LoadConfig(concurrency=(1,), warmup_prompts=1),
+                            measurement=MeasurementConfig(server_metrics_enabled=False),
+                            preflight=PreflightConfig(tokenize=True),
+                            isolated_miss=True,
+                            output=OutputConfig(directory=root / f"results-{name}"),
+                        )
+
+                        with self.assertRaises(ValueError):
+                            run_benchmark(config)
+
+                        self.assertEqual(server.request_count, 0)
+                        self.assertEqual(server.request_bodies, [])
+                        self.assertEqual(server.reset_count, 0)
         finally:
             server.shutdown()
             server.server_close()

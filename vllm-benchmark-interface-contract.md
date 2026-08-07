@@ -2,7 +2,7 @@
 
 ## 1. Contract status
 
-This document defines the proposed v0.1 input and output contract. The benchmark
+This document defines the package 0.2.0 input and output contract. The benchmark
 target is an endpoint pool. A model name is a workload request field.
 
 The following version fields are independent:
@@ -11,7 +11,7 @@ The following version fields are independent:
 {
   "schema_version": "1.0",
   "metric_semantics_version": "1.0",
-  "package_version": "0.1.0"
+  "package_version": "0.2.0"
 }
 ```
 
@@ -35,6 +35,9 @@ class BenchmarkConfig:
     workload: WorkloadConfig
     load: LoadConfig
     measurement: MeasurementConfig
+    preflight: PreflightConfig
+    validity: ValidityConfig
+    isolated_miss: bool
     prefix_cache_reset: PrefixCacheResetConfig
     output: OutputConfig
 ```
@@ -46,7 +49,7 @@ Conceptual subcontracts are:
 class EndpointPoolConfig:
     endpoints: tuple[str, ...]
     routing: str = "round_robin"
-    timeout_s: float = 7200.0
+    timeout_s: float = 720.0
     connection_mode: str = "reuse"
     api_key_env: str | None = None
     headers: tuple[tuple[str, str], ...] = ()
@@ -80,6 +83,18 @@ class MeasurementConfig:
 
 
 @dataclass(frozen=True)
+class PreflightConfig:
+    tokenize: bool = False
+    max_model_len: int | None = None
+
+
+@dataclass(frozen=True)
+class ValidityConfig:
+    min_success_rate: float = 1.0
+    fail_on_request_error: bool = True
+
+
+@dataclass(frozen=True)
 class PrefixCacheResetConfig:
     enabled: bool = True
     timeout_s: float = 60.0
@@ -95,8 +110,8 @@ class OutputConfig:
     overwrite: bool = False
 ```
 
-Exact class names may change before implementation, but their responsibility
-boundaries are contractual.
+These class names and responsibility boundaries are the current package 0.2.0
+contract.
 
 ## 3. CLI contract
 
@@ -110,8 +125,8 @@ endpoint-benchmark run [OPTIONS]
 
 ```text
 --endpoint URL                Required; repeatable
---routing round-robin         Default: round-robin
---timeout SECONDS             Default: 7200
+--routing round_robin         Default: round_robin
+--timeout SECONDS             Default: 720
 --connection-mode reuse|new   Default: reuse
 --api-key-env NAME            Optional; authentication is disabled by default
 --header KEY=VALUE            Optional; repeatable
@@ -123,7 +138,7 @@ Each endpoint is a complete request URL, for example:
 http://host-a:8000/v1/chat/completions
 ```
 
-The endpoint list must be non-empty. In v0.1 all endpoints are assumed to expose
+The endpoint list must be non-empty. All endpoints are assumed to expose
 equivalent OpenAI-compatible behavior.
 
 ### 3.2 Workload
@@ -134,7 +149,7 @@ equivalent OpenAI-compatible behavior.
 --temperature FLOAT               Optional request override
 --max-output-tokens N             Optional request override
 --max-output-tokens-cap N         Optional safety ceiling
---ignore-eos                      Optional vLLM extension
+--ignore-eos / --no-ignore-eos    Optional vLLM extension override
 --extra-body-json PATH            Optional validated request extensions
 ```
 
@@ -165,7 +180,7 @@ messages, model, stream, stream_options
 --warmup-prompts N            Default: 0
 ```
 
-v0.1 uses closed-loop scheduling. `concurrency` means total in-flight requests
+The current implementation uses closed-loop scheduling. `concurrency` means total in-flight requests
 across the endpoint pool, not concurrency per endpoint. Concurrency levels run
 sequentially.
 
@@ -178,12 +193,18 @@ metrics deltas.
 --metrics-url URL             Optional explicit override
 --no-server-metrics           Disable server metrics collection
 --record-chunk-timestamps     Default: false
+--preflight-tokenize          Default: false
+--max-model-len N             Optional; also enables tokenize preflight
+--min-success-rate RATE       Default: 1.0
+--fail-on-request-error       Default: true; --no-fail-on-request-error overrides
 ```
 
 All request observations enter one endpoint-pool measurement pool. The optional
 metrics URL is a single logical service-pool metrics source. By default it is
 derived as `/metrics` on the first endpoint origin. The benchmark does not
-combine per-machine Prometheus endpoints.
+combine per-machine Prometheus endpoints. `max-model-len` is a preflight check,
+not a server setting. The minimum success rate is evaluated per concurrency
+level; `fail-on-request-error` only controls exit code 3 for an invalid run.
 
 ### 3.5 Prefix cache lifecycle
 
@@ -193,6 +214,7 @@ combine per-machine Prometheus endpoints.
 --prefix-cache-reset-timeout SEC     Default: 60
 --prefix-cache-reset-interval SEC    Default: 0.5
 --reset-external-prefix-cache        Default: false
+--isolated-miss                      Give every logical request a unique cache identity
 ```
 
 For every concurrency level, warmup is followed by a pre-reset. The measured
@@ -205,6 +227,12 @@ duration and latency. vLLM must expose the development endpoint by starting with
 Before any warmup, the runner performs a `startup_check` reset against every
 unique engine origin. An HTTP 404 aborts immediately with an explicit
 `VLLM_SERVER_DEV_MODE=1` diagnostic.
+
+`--isolated-miss` skips startup, pre, post, and failure resets. It rejects an
+explicit `--reset-prefix-cache`, external reset, reset timeout, or reset interval.
+Use `--no-reset-prefix-cache` for the cache-enabled baseline in an A/B run.
+Dynamo is treated as an ordinary HTTP endpoint; the client does not discover
+runtimes, probe backends, or clear Dynamo caches.
 
 ### 3.6 Output
 
@@ -282,11 +310,26 @@ prompt_tokens_est
 ```
 
 They are normalized to canonical fields before scheduling. Normalization warnings
-and the detected dataset format are recorded in run metadata.
+are recorded in the top-level `warnings` field of `run.json`.
+
+### 4.4 Isolated miss media
+
+In isolated mode every warmup and measured logical request receives one random
+16-character hexadecimal identity. Text receives a `[rid:<identity>]` prefix in
+the earliest controllable system or user text. Multimodal rows use standard
+`messages` content parts and exactly one strategy per dataset:
+
+- vLLM image parts place `{isolated_miss_id}` in the top-level `uuid`; the URL is
+  unchanged;
+- SGLang image parts place `{isolated_miss_id}` in the URL and omit `uuid`.
+
+Every image must declare exactly one placeholder strategy. Mixed strategies and
+unsupported media fail before network I/O. The client does not send `cache_salt`.
 
 ## 5. Request payload contract
 
-The client enforces:
+The client enforces `messages`, `stream`, and `stream_options`. `model` is added
+only when provided by the CLI or request case:
 
 ```json
 {
@@ -298,15 +341,17 @@ The client enforces:
 ```
 
 The client may add validated workload fields such as temperature, output-token
-limit, tools, tool choice, and backend-specific extensions.
+limit, tools, tool choice, and backend-specific extensions. Isolated mode rewrites
+a deep copy of `messages`; retries before a response reuse the same encoded body.
 
 ## 6. Metric definitions
 
 ### 6.1 Measured interval
 
-`benchmark_duration_s` begins when the first formal request starts and ends when
-the final formal request completes. It excludes warmup, server metrics retrieval,
-dataset loading, and output writing.
+`benchmark_duration_s` begins immediately before formal workload submission and
+ends when all formal request results have been collected. It excludes warmup,
+cache clearing, server metrics retrieval, dataset loading, and output writing,
+but includes a small amount of client scheduling overhead.
 
 ### 6.2 End-to-end latency
 
@@ -352,9 +397,9 @@ total_token_throughput_tps =
     (sum(input_tokens) + sum(output_tokens)) / benchmark_duration_s
 ```
 
-Token throughput is `null` or marked incomplete if successful requests lack
-accurate server-reported usage. Chunk counts are never substituted for token
-counts.
+If any successful request lacks input or output token usage, all three token
+throughput values are `null` and `token_counts_complete=false`. Chunk counts are
+never substituted for token counts.
 
 System output throughput is distinct from single-request generation speed;
 `1000 / TPOT` must not be reported as endpoint-pool throughput.
@@ -412,7 +457,8 @@ Each formal request produces a JSONL record conceptually shaped as:
 
 ```json
 {
-  "id": "request-001",
+  "concurrency": 32,
+  "request_id": "request-001",
   "index": 0,
   "endpoint_index": 0,
   "success": true,
@@ -425,7 +471,10 @@ Each formal request produces a JSONL record conceptually shaped as:
   "tpot_ms": 11.51,
   "started_at_offset_ms": 12.4,
   "finished_at_offset_ms": 3132.9,
-  "finish_reason": "length"
+  "finish_reason": "length",
+  "transport_retries": 0,
+  "inter_chunk_latencies_ms": [11.2, 10.8],
+  "chunk_arrival_offsets_ms": null
 }
 ```
 
@@ -438,8 +487,10 @@ An error is structured:
 }
 ```
 
-Error categories include connection, timeout, HTTP 4xx, HTTP 5xx, truncated
-stream, invalid SSE, invalid JSON, missing usage, and empty output.
+Current error categories are `connection`, `timeout`, `http_error` for every
+non-200 response, `truncated_stream`, and `invalid_json`. A completed 200 stream
+with missing usage or no observable output remains successful, with the affected
+token, TTFT, or TPOT fields set to `null`.
 
 ## 9. Concurrency summary schema
 
@@ -454,6 +505,8 @@ Each concurrency level produces one aggregate summary:
   "failed_requests": 2,
   "timed_out_requests": 1,
   "success_rate": 0.998,
+  "min_success_rate": 1.0,
+  "valid": false,
   "benchmark_duration_s": 41.2,
   "throughput": {
     "requests_per_second": 24.22,
@@ -467,13 +520,17 @@ Each concurrency level produces one aggregate summary:
   "e2e_latency_ms": {},
   "ttft_ms": {},
   "tpot_ms": {},
+  "inter_chunk_latency_ms": {},
+  "transport_retries": 0,
   "routing": {
     "policy": "round_robin",
     "dispatch_count": {"endpoint-0": 500, "endpoint-1": 500}
   },
+  "errors": {"timeout": 1, "http_error": 1},
   "server_metrics": {
     "available": true,
     "url": "http://metrics-host/metrics",
+    "url_source": "explicit",
     "accepted_tokens": 150000,
     "draft_tokens": 200000,
     "acceptance_rate": 0.75,
@@ -487,24 +544,32 @@ pool. The implementation must not average endpoint-specific percentiles.
 
 ## 10. Run result schema
 
-The top-level JSON result is:
+`run.json` is shaped as:
 
 ```json
 {
-  "schema_version": "1.0",
-  "metric_semantics_version": "1.0",
-  "package_version": "0.1.0",
   "run": {
     "label": "benchmark",
     "started_at": "RFC-3339 timestamp",
+    "package_version": "0.2.0",
+    "schema_version": "1.0",
+    "metric_semantics_version": "1.0",
+    "cache_mode": "isolated_miss",
+    "text_strategy": "system_prefix",
+    "media_strategy": "none|vllm_uuid|sglang_unique_content",
     "configuration": {},
     "dataset": {},
     "environment": {}
   },
-  "summaries": [],
+  "valid": true,
+  "preflight": null,
+  "cache_resets": {},
   "warnings": []
 }
 ```
+
+The three cache-strategy fields are present only in isolated mode. Its
+`cache_resets` lists are empty.
 
 Secrets and authorization header values are omitted or redacted.
 
@@ -516,9 +581,12 @@ One run directory contains:
 run.json              Effective redacted configuration and run metadata
 summary.json          Structured summaries for all concurrency levels
 summary.csv           One row per concurrency level
+endpoint_summary.json Per-concurrency, per-endpoint diagnostic summaries
+endpoint_summary.csv  One row per concurrency level and endpoint
 requests.jsonl        Request-level observations
-server_metrics.json   Raw before/after snapshots and normalized counter deltas
-cache_resets.json     Per-level pre/post reset audit records
+server_metrics.json   Normalized server counter deltas
+cache_resets.json     Startup and per-level pre/post reset audit records
+preflight.json        Written when tokenize preflight is enabled and succeeds
 ```
 
 The terminal table displays endpoint-pool-wide values:
@@ -526,16 +594,15 @@ The terminal table displays endpoint-pool-wide values:
 ```text
 concurrency, successful_requests, requested_requests, requests_per_second,
 input_tokens_per_second, output_tokens_per_second, total_tokens_per_second,
-e2e_latency_ms_mean, e2e_latency_ms_p95, e2e_latency_ms_p99,
-ttft_ms_mean, ttft_ms_p95, ttft_ms_p99,
-tpot_ms_mean, tpot_ms_p95, tpot_ms_p99, acceptance_rate
+e2e_latency_ms_p95, ttft_ms_p95, tpot_ms_p95,
+inter_chunk_latency_ms_p95, acceptance_rate
 ```
 
-Server-metric columns are hidden when metrics collection is disabled.
+When metrics collection is disabled, `acceptance_rate` is displayed as `-`.
 
 ## 12. Deferred contracts
 
-The following are intentionally deferred beyond v0.1:
+The following are intentionally deferred:
 
 - open-loop request-rate scheduling;
 - goodput and SLO thresholds;

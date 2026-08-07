@@ -24,6 +24,22 @@ class FakeResponse:
 
 
 class CacheControlTest(unittest.TestCase):
+    def test_accepts_empty_vllm_success_response(self) -> None:
+        with patch(
+            "endpoint_benchmark.cache_control.urllib.request.urlopen",
+            return_value=FakeResponse(b""),
+        ):
+            record = reset_prefix_caches(
+                endpoints=("http://host:8000/v1/chat/completions",),
+                headers={},
+                config=PrefixCacheResetConfig(),
+                concurrency=1,
+                phase="startup_check",
+            )
+
+        self.assertTrue(record["success"])
+        self.assertEqual(record["engines"][0]["attempts"], 1)
+
     def test_reports_missing_vllm_dev_mode_on_404(self) -> None:
         error = HTTPError(
             url="http://host:8000/reset_prefix_cache",

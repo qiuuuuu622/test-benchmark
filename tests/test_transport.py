@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import unittest
 from unittest.mock import patch
@@ -27,13 +28,26 @@ class FakeResponse:
     def readline(self) -> bytes:
         return next(self._lines, b"")
 
-    def read(self) -> bytes:
+    def read(self, amount: int | None = None) -> bytes:
+        del amount
         return b""
 
 
+class ErrorResponse(FakeResponse):
+    status = 400
+
+    def read(self, amount: int | None = None) -> bytes:
+        del amount
+        return b"echo Bearer response-secret"
+
+
 class FakeConnection:
+    def __init__(self) -> None:
+        self.bodies: list[bytes] = []
+
     def request(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
-        pass
+        del args
+        self.bodies.append(kwargs["body"])
 
     def getresponse(self) -> FakeResponse:
         return FakeResponse()
@@ -44,7 +58,13 @@ class FakeConnection:
 
 class BrokenSendConnection(FakeConnection):
     def request(self, *args, **kwargs) -> None:  # noqa: ANN002, ANN003
+        super().request(*args, **kwargs)
         raise BrokenPipeError("stale keep-alive")
+
+
+class BrokenResponseConnection(FakeConnection):
+    def getresponse(self) -> FakeResponse:
+        raise http.client.RemoteDisconnected("stale keep-alive")
 
 
 class TransportTest(unittest.TestCase):
@@ -71,7 +91,9 @@ class TransportTest(unittest.TestCase):
 
     def test_reused_stale_connection_retries_once_before_response(self) -> None:
         client = StreamingHttpClient("reuse")
-        connections = iter((BrokenSendConnection(), FakeConnection()))
+        stale = BrokenSendConnection()
+        replacement = FakeConnection()
+        connections = iter((stale, replacement))
         with (
             patch.object(client, "_connection", side_effect=connections),
             patch.object(client, "_discard_connection"),
@@ -86,6 +108,46 @@ class TransportTest(unittest.TestCase):
 
         self.assertIsNone(result.error)
         self.assertEqual(result.retry_count, 1)
+        self.assertEqual(stale.bodies, replacement.bodies)
+
+    def test_response_failure_does_not_replay_post(self) -> None:
+        client = StreamingHttpClient("reuse")
+        connections = iter((BrokenResponseConnection(), FakeConnection()))
+        with (
+            patch.object(
+                client, "_connection", side_effect=connections
+            ) as connection_factory,
+            patch.object(client, "_discard_connection"),
+        ):
+            result = client.post(
+                "http://example.test/v1/chat/completions",
+                {"messages": [], "stream": True},
+                {},
+                10,
+                False,
+            )
+
+        self.assertEqual(result.error["type"], "connection")
+        self.assertEqual(result.retry_count, 0)
+        self.assertEqual(connection_factory.call_count, 1)
+
+    def test_http_error_redacts_configured_header_values(self) -> None:
+        client = StreamingHttpClient()
+        connection = FakeConnection()
+        with (
+            patch.object(connection, "getresponse", return_value=ErrorResponse()),
+            patch.object(client, "_connection", return_value=connection),
+        ):
+            result = client.post(
+                "http://example.test/v1/chat/completions",
+                {"messages": [], "stream": True},
+                {"Authorization": "Bearer response-secret"},
+                10,
+                False,
+            )
+
+        self.assertIsNotNone(result.error)
+        self.assertNotIn("response-secret", result.error["message"])
 
 
 if __name__ == "__main__":

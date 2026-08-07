@@ -90,10 +90,13 @@ def _reset_one(
                     "start every engine with VLLM_SERVER_DEV_MODE=1"
                 ) from exc
             raise RuntimeError(f"HTTP {exc.code}: {body}") from exc
-        try:
-            value = json.loads(body)
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(f"invalid reset response: {body[:1000]}") from exc
+        if body.strip():
+            try:
+                value = json.loads(body)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(f"invalid reset response: {body[:1000]}") from exc
+        else:
+            value = {"success": True}
         if not isinstance(value, dict) or "success" not in value:
             raise RuntimeError(f"invalid reset response: {value!r}")
         last_response = value

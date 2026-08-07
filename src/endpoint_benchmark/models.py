@@ -150,6 +150,7 @@ class BenchmarkConfig:
     measurement: MeasurementConfig = field(default_factory=MeasurementConfig)
     preflight: PreflightConfig = field(default_factory=PreflightConfig)
     validity: ValidityConfig = field(default_factory=ValidityConfig)
+    isolated_miss: bool = False
     prefix_cache_reset: PrefixCacheResetConfig = field(
         default_factory=PrefixCacheResetConfig
     )
