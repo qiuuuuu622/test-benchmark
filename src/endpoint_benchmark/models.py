@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from endpoint_benchmark.target_config import TargetConfig
+
 
 @dataclass(frozen=True)
 class EndpointPoolConfig:
@@ -25,8 +27,12 @@ class EndpointPoolConfig:
             raise ValueError("at least one endpoint is required")
         for endpoint in self.endpoints:
             parsed = urlsplit(endpoint)
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                raise ValueError(f"invalid HTTP endpoint: {endpoint}")
+            try:
+                _ = parsed.port
+            except ValueError as exc:
+                raise ValueError("invalid HTTP endpoint") from exc
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise ValueError("invalid HTTP endpoint")
         if self.routing != "round_robin":
             raise ValueError("v0.1 only supports round_robin routing")
         if self.timeout_s <= 0:
@@ -153,7 +159,18 @@ class BenchmarkConfig:
     prefix_cache_reset: PrefixCacheResetConfig = field(
         default_factory=PrefixCacheResetConfig
     )
+    target: TargetConfig | None = None
     output: OutputConfig = field(default_factory=OutputConfig)
+
+    def __post_init__(self) -> None:
+        if self.target is None:
+            return
+        if self.target.inference_endpoints != self.endpoint_pool.endpoints:
+            raise ValueError("target and endpoint pool inference endpoints must match")
+        if self.endpoint_pool.api_key_env is not None or dict(
+            self.target.headers
+        ) != dict(self.endpoint_pool.headers):
+            raise ValueError("target and endpoint pool inference headers must match")
 
 
 @dataclass(frozen=True)
@@ -184,6 +201,7 @@ class RequestResult:
     started_at_offset_ms: float
     finished_at_offset_ms: float
     finish_reason: str | None
+    cached_input_tokens: int | None = None
     transport_retries: int = 0
     inter_chunk_latencies_ms: list[float] = field(default_factory=list)
     chunk_arrival_offsets_ms: list[float] | None = None

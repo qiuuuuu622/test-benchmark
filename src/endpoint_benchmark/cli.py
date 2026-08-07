@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from endpoint_benchmark.models import (
     WorkloadConfig,
 )
 from endpoint_benchmark.runner import run_benchmark
+from endpoint_benchmark.target_config import default_targets_path, load_target
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -54,7 +56,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command")
     run = subparsers.add_parser("run", help="run a closed-loop benchmark")
-    run.add_argument("--endpoint", action="append", required=True)
+    destination = run.add_mutually_exclusive_group(required=True)
+    destination.add_argument("--endpoint", action="append")
+    destination.add_argument("--target")
+    run.add_argument("--targets-file", type=Path)
     run.add_argument("--routing", default="round_robin", choices=("round_robin",))
     run.add_argument("--timeout", type=float, default=720.0)
     run.add_argument("--connection-mode", choices=("reuse", "new"), default="reuse")
@@ -88,10 +93,25 @@ def _parser() -> argparse.ArgumentParser:
         "--reset-prefix-cache",
         action=argparse.BooleanOptionalAction,
         default=True,
+        help="run startup/pre/post unified cache clears (default: enabled)",
     )
-    run.add_argument("--prefix-cache-reset-timeout", type=float, default=60.0)
-    run.add_argument("--prefix-cache-reset-interval", type=float, default=0.5)
-    run.add_argument("--reset-external-prefix-cache", action="store_true")
+    run.add_argument(
+        "--prefix-cache-reset-timeout",
+        type=float,
+        metavar="SEC",
+        help="shared clear deadline (default: Target value or 60)",
+    )
+    run.add_argument(
+        "--prefix-cache-reset-interval",
+        type=float,
+        metavar="SEC",
+        help="clear retry interval (default: Target value or 0.5)",
+    )
+    run.add_argument(
+        "--reset-external-prefix-cache",
+        action="store_true",
+        help="also clear vLLM external prefix cache (default: false)",
+    )
     run.add_argument("--output-dir", type=Path, default=Path("benchmark_results"))
     run.add_argument("--label", default="benchmark")
     run.add_argument("--run-name")
@@ -100,14 +120,43 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
+    target = None
+    if args.target is not None:
+        if args.header or args.api_key_env:
+            raise ValueError(
+                "--target cannot be combined with --header or --api-key-env"
+            )
+        target = load_target(args.targets_file or default_targets_path(), args.target)
+        target = replace(
+            target,
+            clear_timeout_s=(
+                args.prefix_cache_reset_timeout
+                if args.prefix_cache_reset_timeout is not None
+                else target.clear_timeout_s
+            ),
+            clear_retry_interval_s=(
+                args.prefix_cache_reset_interval
+                if args.prefix_cache_reset_interval is not None
+                else target.clear_retry_interval_s
+            ),
+        )
+        endpoints = target.inference_endpoints
+        headers = target.headers
+        api_key_env = None
+    else:
+        if args.targets_file is not None:
+            raise ValueError("--targets-file requires --target")
+        endpoints = tuple(args.endpoint)
+        headers = tuple(_parse_header(value) for value in args.header)
+        api_key_env = args.api_key_env
     return BenchmarkConfig(
         endpoint_pool=EndpointPoolConfig(
-            endpoints=tuple(args.endpoint),
+            endpoints=endpoints,
             routing=args.routing,
             timeout_s=args.timeout,
             connection_mode=args.connection_mode,
-            api_key_env=args.api_key_env,
-            headers=tuple(_parse_header(value) for value in args.header),
+            api_key_env=api_key_env,
+            headers=headers,
         ),
         workload=WorkloadConfig(
             dataset=args.dataset,
@@ -140,10 +189,27 @@ def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
         ),
         prefix_cache_reset=PrefixCacheResetConfig(
             enabled=args.reset_prefix_cache,
-            timeout_s=args.prefix_cache_reset_timeout,
-            retry_interval_s=args.prefix_cache_reset_interval,
+            timeout_s=(
+                target.clear_timeout_s
+                if target is not None
+                else (
+                    args.prefix_cache_reset_timeout
+                    if args.prefix_cache_reset_timeout is not None
+                    else 60.0
+                )
+            ),
+            retry_interval_s=(
+                target.clear_retry_interval_s
+                if target is not None
+                else (
+                    args.prefix_cache_reset_interval
+                    if args.prefix_cache_reset_interval is not None
+                    else 0.5
+                )
+            ),
             reset_external=args.reset_external_prefix_cache,
         ),
+        target=target,
         output=OutputConfig(
             directory=args.output_dir,
             label=args.label,
@@ -155,7 +221,7 @@ def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
 
 def _parse_header(value: str) -> tuple[str, str]:
     if "=" not in value:
-        raise ValueError(f"header must be KEY=VALUE: {value}")
+        raise ValueError("header must use KEY=VALUE")
     name, header_value = value.split("=", 1)
     if not name:
         raise ValueError("header name cannot be empty")

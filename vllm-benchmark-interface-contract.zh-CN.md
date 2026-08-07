@@ -2,7 +2,7 @@
 
 ## 1. 契约状态
 
-本文定义拟定的 v0.1 输入输出契约。Benchmark 的目标是 endpoint pool，模型名只是 workload 请求字段。
+本文定义 v0.2 输入输出契约。Benchmark 的目标是逻辑 Target 或临时 endpoint pool，模型名只是 workload 请求字段。
 
 版本字段相互独立：
 
@@ -10,7 +10,7 @@
 {
   "schema_version": "1.0",
   "metric_semantics_version": "1.0",
-  "package_version": "0.1.0"
+  "package_version": "0.2.0"
 }
 ```
 
@@ -33,6 +33,7 @@ class BenchmarkConfig:
     workload: WorkloadConfig
     load: LoadConfig
     measurement: MeasurementConfig
+    target: TargetConfig | None
     output: OutputConfig
 ```
 
@@ -42,6 +43,7 @@ class BenchmarkConfig:
 - `WorkloadConfig`：dataset、model、生成参数和 `extra_body`；
 - `LoadConfig`：并发档位、请求数、shuffle、seed 和 warmup；
 - `MeasurementConfig`：默认从第一个 endpoint 推导的 metrics URL、关闭开关和可选 chunk 时间戳；
+- `TargetConfig`：推理 endpoints、headers、direct/Dynamo cache sources 和统一 clear deadline；
 - `OutputConfig`：输出根目录、label、可选 run name 和覆盖策略。
 
 精确类名可在实现前调整，但职责边界属于契约。
@@ -55,7 +57,9 @@ endpoint-benchmark run [OPTIONS]
 ### 3.1 Endpoint Pool
 
 ```text
---endpoint URL                必填，可重复
+--endpoint URL                与 --target 二选一；可重复
+--target NAME                 与 --endpoint 二选一
+--targets-file PATH           Target TOML；默认 XDG 配置路径
 --routing round-robin         默认 round-robin
 --timeout SECONDS             默认 7200
 --connection-mode reuse|new   默认 reuse
@@ -69,7 +73,7 @@ endpoint-benchmark run [OPTIONS]
 http://host-a:8000/v1/chat/completions
 ```
 
-endpoint 列表不能为空。v0.1 假设所有 endpoint 提供等价的 OpenAI-compatible 行为。
+endpoint 列表不能为空。v0.2 假设所有 endpoint 提供等价的 OpenAI-compatible 行为。Target 模式不允许用 `--header` 或 `--api-key-env` 覆盖 inference headers。
 
 ### 3.2 Workload
 
@@ -107,7 +111,7 @@ messages, model, stream, stream_options
 --warmup-prompts N            默认 5
 ```
 
-v0.1 使用 closed-loop。`concurrency` 是 endpoint pool 的总在途请求数，不是每个 endpoint 的并发数。不同并发档位顺序执行。
+v0.2 使用 closed-loop。`concurrency` 是 endpoint pool 的总在途请求数，不是每个 endpoint 的并发数。不同并发档位顺序执行。
 
 Warmup 不计入正式请求数、延迟、吞吐和 server metrics delta。
 
@@ -121,19 +125,19 @@ Warmup 不计入正式请求数、延迟、吞吐和 server metrics delta。
 
 所有请求观测直接进入同一个 endpoint-pool measurement pool。默认从第一个请求 endpoint 的 origin 推导 `/metrics`；也可以显式指定一个逻辑服务池指标 URL。Benchmark 不合并各机器独立的 Prometheus endpoint。
 
-### 3.5 Prefix Cache 生命周期
+### 3.5 Runtime Cache 生命周期
 
 ```text
 --reset-prefix-cache                 默认 true
---no-reset-prefix-cache              显式关闭
+--no-reset-prefix-cache              显式关闭整套清理生命周期
 --prefix-cache-reset-timeout SEC     默认 60
 --prefix-cache-reset-interval SEC    默认 0.5
 --reset-external-prefix-cache        默认 false
 ```
 
-每个并发档位在 warmup 后执行 pre-reset；所有唯一 engine origin 返回 `success=true` 后才开始正式计时。正式请求全部结束后，先采集 metrics-after，再执行 post-reset；全部成功后才允许进入下一档。Reset 耗时不计入 benchmark duration 或延迟。vLLM 必须通过 `VLLM_SERVER_DEV_MODE=1` 开启开发管理接口。
+首次 warmup 前，对全部唯一 cache instance 执行 `startup_check`。每个并发档位 warmup 后执行 pre-clear；全部实例成功后才采集 metrics-before 并开始正式计时。请求完成并采集 metrics-after 后执行 post-clear，成功后才能进入下一档；请求阶段异常时执行 post-failure clear。clear、probe 和 retry 均不计入 benchmark duration 或请求延迟。
 
-任何 warmup 之前，runner 会先对全部唯一 engine origin 执行一次 `startup_check` reset。若返回 HTTP 404，立即终止并明确提示需要设置 `VLLM_SERVER_DEV_MODE=1`。
+direct source 依次用只读 `/version`、`/server_info` 识别 vLLM/SGLang；Dynamo 1.3.0 legacy source 对每个 component discovery 一次并逐 instance ID 调用 `clear_kv_blocks`。任一未知或失败实例都会 fail closed。Target TOML 可配置 `clear_timeout_s` 与 `clear_retry_interval_s`，显式 CLI 值优先；临时 `--endpoint` 模式使用相同内部 Target 路径。vLLM 必须通过 `VLLM_SERVER_DEV_MODE=1` 开启开发管理接口；只有传 `--reset-external-prefix-cache` 时才使用 `reset_external=true`。
 
 ### 3.6 Output
 
@@ -159,7 +163,6 @@ endpoint-benchmark run \
   --concurrency 1 8 16 32 64 \
   --warmup-prompts 10 \
   --max-output-tokens-cap 1024 \
-  --reset-prefix-cache \
   --output-dir results \
   --label run-001
 ```
@@ -403,7 +406,7 @@ acceptance_rate = accepted_tokens / draft_tokens
 {
   "schema_version": "1.0",
   "metric_semantics_version": "1.0",
-  "package_version": "0.1.0",
+  "package_version": "0.2.0",
   "run": {
     "label": "benchmark",
     "started_at": "RFC-3339 timestamp",
@@ -428,7 +431,7 @@ summary.json          所有并发档位的结构化汇总
 summary.csv           每个并发档位一行
 requests.jsonl        请求级观测
 server_metrics.json   原始 before/after 快照和规范化 counter delta
-cache_resets.json     每个档位 pre/post reset 审计记录
+cache_resets.json     startup check 与每个档位 pre/post clear 的逐实例审计记录
 ```
 
 终端表格展示 endpoint pool 总体结果：
@@ -443,7 +446,7 @@ tpot_ms_mean, tpot_ms_p95, tpot_ms_p99, acceptance_rate
 
 未启用 server metrics 时隐藏相应列。
 
-## 12. v0.1 暂缓项
+## 12. v0.2 暂缓项
 
 - open-loop request-rate 调度；
 - goodput 和 SLO；

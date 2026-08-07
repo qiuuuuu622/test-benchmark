@@ -46,10 +46,28 @@ def _normalize_row(
     messages = row.get("messages")
     if not isinstance(messages, list) or not messages:
         raise ValueError(f"dataset line {line_number} requires non-empty messages")
+    if not all(isinstance(message, dict) for message in messages):
+        raise ValueError(f"dataset line {line_number} messages must be objects")
+    messages = [dict(message) for message in messages]
 
     request = dict(row.get("request") or {})
     if not isinstance(row.get("request", {}), dict):
         raise ValueError(f"dataset line {line_number} request must be an object")
+
+    if "tools" in row:
+        tools = row["tools"]
+        if not isinstance(tools, list) or not tools:
+            raise ValueError(
+                f"dataset line {line_number} tools must be a non-empty array"
+            )
+        if "tools" in request and request["tools"] != tools:
+            raise ValueError(f"dataset line {line_number} has conflicting tools")
+        request["tools"] = tools
+        warnings.add("normalized legacy field tools")
+
+    if "images" in row:
+        messages = _normalize_images(messages, row["images"], line_number)
+        warnings.add("normalized legacy field images")
 
     if "max_output_tokens" not in request:
         for alias in _MAX_TOKEN_ALIASES:
@@ -69,3 +87,43 @@ def _normalize_row(
         request=request,
         metadata=metadata,
     )
+
+
+def _normalize_images(
+    messages: list[dict[str, Any]], images: Any, line_number: int
+) -> list[dict[str, Any]]:
+    if not isinstance(images, list) or not images or not all(
+        isinstance(image, str) and image for image in images
+    ):
+        raise ValueError(f"dataset line {line_number} images must be non-empty strings")
+    marker_count = sum(
+        message.get("content", "").count("<image>")
+        for message in messages
+        if isinstance(message.get("content"), str)
+    )
+    if marker_count != len(images):
+        raise ValueError(
+            f"dataset line {line_number} has {marker_count} image markers "
+            f"for {len(images)} images"
+        )
+
+    image_index = 0
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, str) or "<image>" not in content:
+            continue
+        parts = content.split("<image>")
+        normalized: list[dict[str, Any]] = []
+        for index, text in enumerate(parts):
+            if text:
+                normalized.append({"type": "text", "text": text})
+            if index < len(parts) - 1:
+                normalized.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": images[image_index]},
+                    }
+                )
+                image_index += 1
+        message["content"] = normalized
+    return messages

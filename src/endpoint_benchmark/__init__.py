@@ -13,6 +13,11 @@ from endpoint_benchmark.models import (
     WorkloadConfig,
 )
 from endpoint_benchmark.runner import run_benchmark
+from endpoint_benchmark.target_config import (
+    DirectCacheSource,
+    DynamoCacheSource,
+    TargetConfig,
+)
 from endpoint_benchmark.version import __version__
 
 __all__ = [
@@ -22,8 +27,11 @@ __all__ = [
     "LoadConfig",
     "MeasurementConfig",
     "OutputConfig",
-    "PreflightConfig",
     "PrefixCacheResetConfig",
+    "PreflightConfig",
+    "DirectCacheSource",
+    "DynamoCacheSource",
+    "TargetConfig",
     "WorkloadConfig",
     "ValidityConfig",
     "__version__",

@@ -123,7 +123,8 @@ Configuration is split by responsibility:
 - `LoadConfig`: concurrency, request count, order, seed, and warmup;
 - `MeasurementConfig`: timing details, the derived or explicit metrics URL, and
   its disable switch;
-- `PrefixCacheResetConfig`: mandatory-by-default per-level pre/post cache reset;
+- `TargetConfig`: inference entrypoints, direct/Dynamo cache sources, and the
+  shared clear deadline;
 - `OutputConfig`: result location and serialization policy.
 
 Frozen dataclasses are preferred so a running benchmark cannot silently mutate
@@ -145,18 +146,19 @@ A configured output-token cap is always applied as a safety ceiling.
 
 ### 4.4 Load scheduler
 
-v0.1 uses closed-loop concurrency: each worker begins its next request after its
+v0.2 uses closed-loop concurrency: each worker begins its next request after its
 previous request completes. A concurrency value is the total concurrency for the
 whole endpoint pool, not concurrency per endpoint.
 
 Concurrency levels run sequentially and produce separate summaries. Warmup runs
 before formal measurement and is excluded from results.
 
-After warmup, each level resets all unique engine origins before metrics-before
-and formal timing. After all requests complete, metrics-after is collected before
-a second reset. Every reset must succeed before advancing to the next level.
-Before the first warmup, a startup reset verifies that every engine exposes the
-development management endpoint and fails closed with a dev-mode diagnostic.
+By default, a startup check runs before the first warmup. After warmup, each level
+resolves every instance from the Target's direct sources and Dynamo discovery
+snapshot, probes direct runtimes, and performs a parallel pre-clear before
+metrics-before and formal timing. A post-clear follows metrics-after, and request
+execution failures trigger a post-failure clear. Any failed or unknown instance
+fails closed; `--no-reset-prefix-cache` explicitly skips the entire lifecycle.
 
 The configuration model should allow a future open-loop scheduler without
 changing endpoint, workload, measurement, or result contracts. Future scheduling

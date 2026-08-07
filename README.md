@@ -1,4 +1,4 @@
-# endpoint-benchmark：从零开始压测 vLLM Endpoint
+# endpoint-benchmark：从零开始压测 vLLM / SGLang Endpoint
 
 `endpoint-benchmark` 是一个面向 OpenAI 兼容流式接口的轻量压测工具。它不把目标抽象成“模型”，而是抽象成一个或多个 HTTP endpoint；多个 endpoint 会按照 round-robin 分发请求，并在同一个测量池中统计 TTFT、TPOT、E2E 延迟和 token 吞吐。
 
@@ -44,7 +44,7 @@ uv pip install --python ~/qwen35-benchmark/.venv-benchmark/bin/python -e .
 uv pip install \
   --python ~/qwen35-benchmark/.venv-benchmark/bin/python \
   --no-deps \
-  dist/endpoint_benchmark-0.1.1-py3-none-any.whl
+  dist/endpoint_benchmark-0.2.0-py3-none-any.whl
 ```
 
 ## 2. 下载 Qwen3.5-4B
@@ -112,13 +112,7 @@ curl -fsS -X POST \
   'http://127.0.0.1:8000/reset_prefix_cache?reset_running_requests=false&reset_external=false'
 ```
 
-正常响应应包含：
-
-```json
-{"success":true}
-```
-
-如果返回 404，请确认启动 vLLM 时设置了 `VLLM_SERVER_DEV_MODE=1`。`endpoint-benchmark` 默认会在每个并发档位测量前后清理 prefix cache，并在正式压测前检查该接口。
+vLLM 0.24.0 成功时 body 为空；新版 JSON 必须返回 `success=true`，`success=false` 会重试。如果返回 404，请确认启动 vLLM 时设置了 `VLLM_SERVER_DEV_MODE=1`。默认会在首次 warmup 前做 startup check，并在每个并发档位的 warmup 后和 measurement 后分别做 pre/post clear；任一次失败都会中止后续流程。明确要保留 cache 时可传 `--no-reset-prefix-cache` 跳过整套清理生命周期。
 
 ## 4. 准备 JSONL 测试数据
 
@@ -135,7 +129,7 @@ curl -fsS -X POST \
 ~/qwen35-benchmark/requests.jsonl
 ```
 
-工具也兼容顶层的 `target_tokens`、`max_tokens` 和 `max_completion_tokens`，它们会被规范化为 `request.max_output_tokens`。如果命令行指定 `--max-output-tokens-cap 128`，数据集中更大的输出长度会被截到 128。
+工具也兼容顶层的 `target_tokens`、`max_tokens` 和 `max_completion_tokens`，它们会被规范化为 `request.max_output_tokens`；顶层 `tools` 会进入 OpenAI 请求；顶层 `images` 会按消息中的 `<image>` 顺序转换为 `image_url` 内容。如果命令行指定 `--max-output-tokens-cap 128`，数据集中更大的输出长度会被截到 128。
 
 开始前要确认：
 
@@ -183,6 +177,40 @@ cd ~/qwen35-benchmark
 - `--max-model-len 32768`：preflight 使用的上下文上限。发现输入与输出之和超限时直接停止，不发送正式 workload。
 - `--min-success-rate 1.0`：要求每档请求 100% 成功。结果仍会写入磁盘，但不达标时命令返回退出码 3。
 - `--no-server-metrics`：不读取 vLLM `/metrics`，但不会关闭客户端 TTFT、TPOT、E2E、request/s 或 token/s 统计。
+- `--no-reset-prefix-cache`：显式跳过 startup/pre/post clear；默认不传时会清理。
+- `--prefix-cache-reset-timeout 60` / `--prefix-cache-reset-interval 0.5`：覆盖本次运行所有 direct/Dynamo cache source 的统一 deadline 与重试间隔。
+- `--reset-external-prefix-cache`：令 vLLM 同时清理 external prefix cache；默认 false，不影响 SGLang 或 Dynamo 的清理操作。
+
+### 使用 Target 管理 gateway 与物理 cache 实例
+
+`--endpoint` 适合每个地址就是物理 vLLM/SGLang 实例的简单场景。若推理入口是 gateway/LB，使用 Target 把推理入口和需要逐个清理的实例分开：
+
+```toml
+# ~/.config/endpoint-benchmark/targets.toml
+[targets.mixed]
+inference_endpoints = ["http://gateway:8080/v1/chat/completions"]
+header_env = { Authorization = "INFERENCE_AUTH_HEADER" }
+
+[[targets.mixed.cache_sources]]
+kind = "direct"
+endpoints = ["http://vllm-worker:8000", "http://sglang-worker:30000"]
+header_env = { Authorization = "ADMIN_AUTH_HEADER" }
+```
+
+```bash
+endpoint-benchmark run \
+  --target mixed \
+  --dataset ./requests.jsonl \
+  --concurrency 1 4 8
+```
+
+程序依次用只读 `/version`、`/server_info` 识别 direct 实例；vLLM 调用 `/reset_prefix_cache`，SGLang 调用 `/flush_cache`，启用 HiCache 时再清理 storage backend。Target 模式不允许再用 `--header` 或 `--api-key-env` 覆盖配置；CLI 的 cache timeout/interval 显式值会覆盖 Target TOML，本次运行未传时沿用 Target 配置。
+
+Dynamo 1.3.0 legacy source 需要 Linux 可选依赖：
+
+```bash
+uv pip install 'endpoint-benchmark[dynamo]'
+```
 
 输出目录会自动带时间戳，例如：
 
@@ -198,7 +226,7 @@ results/qwen35-4b-single-gpu_20260806_120000/
 - `endpoint_summary.json`：JSON 格式的 endpoint 诊断结果。
 - `requests.jsonl`：每条请求的成功状态、endpoint、TTFT、TPOT 和 E2E 等原始结果。
 - `preflight.json`：启用 tokenize preflight 时的数据 token 分布和上下文检查结果。
-- `cache_resets.json`：每次 prefix-cache 清理的审计记录。
+- `cache_resets.json`：startup check 以及每档 pre/post clear 的逐 cache 实例审计记录；关闭清理时各档记录为空数组。
 - `run.json`：完整运行配置和数据集告警。
 
 ## 6. 多个 Endpoint 的 round-robin 示例
@@ -228,7 +256,7 @@ results/qwen35-4b-single-gpu_20260806_120000/
   --label qwen35-4b-four-endpoints
 ```
 
-所有请求按 round-robin 分发，但会进入同一个测量池。因此 `ttft_ms_p95` 是四个副本所有成功请求合并后的整体 P95，不是第一个副本的 P95，也不是四个副本 P95 的平均数。
+所有请求按 round-robin 分发，但会进入同一个测量池。因此 `ttft_ms_p95` 是四个副本所有成功请求合并后的整体 P95，不是第一个副本的 P95，也不是四个副本 P95 的平均数。每个显式 endpoint origin 都会单独清理；若这里填写的是隐藏多个副本的 LB，请改用 Target 显式声明物理 cache 实例。
 
 `--no-server-metrics` 只关闭服务端 Prometheus 指标采集。四副本池级的 TTFT、TPOT、E2E、request/s 和 token/s 仍然由客户端统一计算。只有在已有一个能够代表整个副本池的统一 metrics 入口时，才应改用：
 
@@ -323,7 +351,7 @@ E2E = 请求结束时间 - 请求开始时间
 
 ## 9. 常见问题
 
-### 启动检查提示缺少 reset_prefix_cache
+### cache clear 提示缺少 reset_prefix_cache
 
 确认 vLLM 启动命令包含：
 
@@ -331,7 +359,7 @@ E2E = 请求结束时间 - 请求开始时间
 VLLM_SERVER_DEV_MODE=1
 ```
 
-如果明确不需要清理 prefix cache，可以传 `--no-reset-prefix-cache`，但不同并发档位可能受到历史 cache 状态影响。
+默认 cache clear 启用。若这次压测明确需要保留 cache，可传 `--no-reset-prefix-cache`；否则推理入口是 gateway 或未暴露管理接口时，请用 Target 将 inference endpoint 与物理 cache 实例地址分开。
 
 ### 请求返回 maximum context length
 

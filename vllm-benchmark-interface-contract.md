@@ -2,8 +2,9 @@
 
 ## 1. Contract status
 
-This document defines the proposed v0.1 input and output contract. The benchmark
-target is an endpoint pool. A model name is a workload request field.
+This document defines the v0.2 input and output contract. The benchmark target is
+a logical Target or a temporary endpoint pool. A model name is a workload request
+field.
 
 The following version fields are independent:
 
@@ -11,7 +12,7 @@ The following version fields are independent:
 {
   "schema_version": "1.0",
   "metric_semantics_version": "1.0",
-  "package_version": "0.1.0"
+  "package_version": "0.2.0"
 }
 ```
 
@@ -35,7 +36,7 @@ class BenchmarkConfig:
     workload: WorkloadConfig
     load: LoadConfig
     measurement: MeasurementConfig
-    prefix_cache_reset: PrefixCacheResetConfig
+    target: TargetConfig | None
     output: OutputConfig
 ```
 
@@ -80,11 +81,12 @@ class MeasurementConfig:
 
 
 @dataclass(frozen=True)
-class PrefixCacheResetConfig:
-    enabled: bool = True
-    timeout_s: float = 60.0
-    retry_interval_s: float = 0.5
-    reset_external: bool = False
+class TargetConfig:
+    inference_endpoints: tuple[str, ...]
+    cache_sources: tuple[DirectCacheSource | DynamoCacheSource, ...]
+    headers: tuple[tuple[str, str], ...] = ()
+    clear_timeout_s: float = 60.0
+    clear_retry_interval_s: float = 0.5
 
 
 @dataclass(frozen=True)
@@ -109,7 +111,9 @@ endpoint-benchmark run [OPTIONS]
 ### 3.1 Endpoint pool
 
 ```text
---endpoint URL                Required; repeatable
+--endpoint URL                Mutually exclusive with --target; repeatable
+--target NAME                 Mutually exclusive with --endpoint
+--targets-file PATH           Target TOML; defaults to the XDG config path
 --routing round-robin         Default: round-robin
 --timeout SECONDS             Default: 7200
 --connection-mode reuse|new   Default: reuse
@@ -123,8 +127,9 @@ Each endpoint is a complete request URL, for example:
 http://host-a:8000/v1/chat/completions
 ```
 
-The endpoint list must be non-empty. In v0.1 all endpoints are assumed to expose
-equivalent OpenAI-compatible behavior.
+The endpoint list must be non-empty. In v0.2 all endpoints are assumed to expose
+equivalent OpenAI-compatible behavior. Target mode rejects `--header` and
+`--api-key-env` inference-header overrides.
 
 ### 3.2 Workload
 
@@ -165,7 +170,7 @@ messages, model, stream, stream_options
 --warmup-prompts N            Default: 0
 ```
 
-v0.1 uses closed-loop scheduling. `concurrency` means total in-flight requests
+v0.2 uses closed-loop scheduling. `concurrency` means total in-flight requests
 across the endpoint pool, not concurrency per endpoint. Concurrency levels run
 sequentially.
 
@@ -185,26 +190,31 @@ metrics URL is a single logical service-pool metrics source. By default it is
 derived as `/metrics` on the first endpoint origin. The benchmark does not
 combine per-machine Prometheus endpoints.
 
-### 3.5 Prefix cache lifecycle
+### 3.5 Runtime cache lifecycle
 
 ```text
 --reset-prefix-cache                 Default: true
---no-reset-prefix-cache              Explicitly disable reset
+--no-reset-prefix-cache              Explicitly disable all cache clears
 --prefix-cache-reset-timeout SEC     Default: 60
 --prefix-cache-reset-interval SEC    Default: 0.5
 --reset-external-prefix-cache        Default: false
 ```
 
-For every concurrency level, warmup is followed by a pre-reset. The measured
-workload starts only after every unique engine origin reports `success=true`.
-After all workload requests complete, metrics-after is collected and a post-reset
-must succeed before the next level begins. Reset time is excluded from benchmark
-duration and latency. vLLM must expose the development endpoint by starting with
-`VLLM_SERVER_DEV_MODE=1`.
+Before the first warmup, a `startup_check` clears every unique cache instance.
+Each concurrency level performs a pre-clear after warmup and starts metrics-before
+and formal timing only after every instance succeeds. After requests and
+metrics-after complete, a post-clear must succeed before the next level; request
+execution failures trigger a post-failure clear. Probe, retry, and clear time is
+excluded from benchmark duration and request latency.
 
-Before any warmup, the runner performs a `startup_check` reset against every
-unique engine origin. An HTTP 404 aborts immediately with an explicit
-`VLLM_SERVER_DEV_MODE=1` diagnostic.
+Direct sources are identified read-only through `/version` then `/server_info`;
+each Dynamo 1.3.0 legacy component is discovered once per clear and
+`clear_kv_blocks` is called for every instance ID. Any unknown or failed instance
+fails closed. Target TOML can set `clear_timeout_s` and
+`clear_retry_interval_s`; explicit CLI values override it. Temporary `--endpoint`
+mode uses the same internal Target path. vLLM requires
+`VLLM_SERVER_DEV_MODE=1`; `reset_external=true` is sent only when
+`--reset-external-prefix-cache` is provided.
 
 ### 3.6 Output
 
@@ -232,7 +242,6 @@ endpoint-benchmark run \
   --concurrency 1 8 16 32 64 \
   --warmup-prompts 10 \
   --max-output-tokens-cap 1024 \
-  --reset-prefix-cache \
   --output-dir results \
   --label run-001
 ```
@@ -493,7 +502,7 @@ The top-level JSON result is:
 {
   "schema_version": "1.0",
   "metric_semantics_version": "1.0",
-  "package_version": "0.1.0",
+  "package_version": "0.2.0",
   "run": {
     "label": "benchmark",
     "started_at": "RFC-3339 timestamp",
@@ -518,7 +527,7 @@ summary.json          Structured summaries for all concurrency levels
 summary.csv           One row per concurrency level
 requests.jsonl        Request-level observations
 server_metrics.json   Raw before/after snapshots and normalized counter deltas
-cache_resets.json     Per-level pre/post reset audit records
+cache_resets.json     Startup and per-level pre/post per-instance audit records
 ```
 
 The terminal table displays endpoint-pool-wide values:
@@ -535,7 +544,7 @@ Server-metric columns are hidden when metrics collection is disabled.
 
 ## 12. Deferred contracts
 
-The following are intentionally deferred beyond v0.1:
+The following are intentionally deferred beyond v0.2:
 
 - open-loop request-rate scheduling;
 - goodput and SLO thresholds;

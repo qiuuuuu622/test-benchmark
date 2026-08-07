@@ -75,6 +75,9 @@ class StreamingHttpClient:
             )
             if response.status != 200:
                 message = response.read(2000).decode("utf-8", errors="replace")
+                for secret in headers.values():
+                    if secret:
+                        message = message.replace(secret, "[REDACTED]")
                 self._discard_connection(parsed)
                 return TransportResult(
                     status_code=response.status,
@@ -164,7 +167,7 @@ class StreamingHttpClient:
         headers: dict[str, str],
         timeout_s: float,
     ) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse, int]:
-        """Send once, reconnecting one stale reused socket before response."""
+        """Retry once only when submitting to a stale reused socket fails."""
         retryable = (
             BrokenPipeError,
             ConnectionResetError,
@@ -184,7 +187,8 @@ class StreamingHttpClient:
                 if self._connection_mode != "reuse" or attempt == 1:
                     raise
                 continue
-            return connection, connection.getresponse(), attempt
+            response = connection.getresponse()
+            return connection, response, attempt
         raise AssertionError("unreachable")
 
     def close(self) -> None:

@@ -103,7 +103,7 @@ CLI 只负责解析参数、展示进度和结果表格，不实现压测逻辑�
 - `WorkloadConfig`：数据集和默认 payload 字段；
 - `LoadConfig`：并发、请求数、顺序、随机种子和 warmup；
 - `MeasurementConfig`：计时细节、自动推导或显式 metrics URL 及关闭开关；
-- `PrefixCacheResetConfig`：默认启用的每档 pre/post prefix cache reset；
+- `TargetConfig`：推理入口、direct/Dynamo cache 实例来源和统一 clear deadline；
 - `OutputConfig`：结果路径和序列化策略。
 
 配置优先使用 frozen dataclass，防止运行期间静默改变有效配置。
@@ -122,19 +122,17 @@ CLI 显式覆盖 > 数据集单请求字段 > 省略并使用服务端默认值
 
 ### 4.4 负载调度器
 
-v0.1 使用 closed-loop concurrency：每个 worker 完成前一个请求后再发下一个请求。并发值表示整个 endpoint pool 的总并发，而不是每个 endpoint 的并发。
+v0.2 使用 closed-loop concurrency：每个 worker 完成前一个请求后再发下一个请求。并发值表示整个 endpoint pool 的总并发，而不是每个 endpoint 的并发。
 
 不同并发档位顺序执行并分别生成 summary。warmup 在正式测量前运行，不计入结果。
 
-每个档位 warmup 完成后，对全部唯一 engine origin 执行 pre-reset，再采集 metrics-before 并开始正式计时。正式请求全部结束后先采集 metrics-after，再执行 post-reset；所有 reset 成功后才能进入下一档。
-
-第一次 warmup 之前先执行 startup reset，确认全部引擎都暴露开发管理接口；未启用时明确提示 dev mode 并 fail-closed。
+默认在首次 warmup 前执行 startup check。每个档位 warmup 完成后，从 Target 声明的 direct 地址和 Dynamo discovery snapshot 得到全部实例，识别 direct runtime，并行执行 pre-clear；全部成功后才采集 metrics-before 并开始正式计时。metrics-after 后执行 post-clear，请求阶段异常时执行 post-failure clear。显式 `--no-reset-prefix-cache` 会跳过整套清理生命周期。
 
 配置模型应允许未来加入 open-loop scheduler，而不改变 endpoint、workload、measurement 和 result 契约。未来可支持 request rate、最大并发以及 Poisson/constant 到达分布。
 
 ### 4.5 Endpoint Pool Router
 
-v0.1 提供线程安全且确定性的 round-robin 路由。记录每个 endpoint 的分发请求数用于审计，但默认性能报告只展示 endpoint pool 总体结果。
+v0.2 提供线程安全且确定性的 round-robin 路由。记录每个 endpoint 的分发请求数用于审计，但默认性能报告只展示 endpoint pool 总体结果。
 
 路由只负责选择请求 endpoint。无论请求由哪个 endpoint 服务，其结果都直接进入同一个 measurement pool。
 

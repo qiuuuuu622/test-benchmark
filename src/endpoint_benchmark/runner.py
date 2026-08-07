@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from endpoint_benchmark.aggregation import summarize_endpoints, summarize_requests
-from endpoint_benchmark.cache_control import reset_prefix_caches
+from endpoint_benchmark.cache_control import clear_caches
 from endpoint_benchmark.dataset import load_dataset
 from endpoint_benchmark.models import (
     BenchmarkConfig,
@@ -26,12 +26,19 @@ from endpoint_benchmark.server_metrics import (
     calculate_metrics_delta,
     fetch_metrics,
 )
+from endpoint_benchmark.target_config import (
+    DirectCacheSource,
+    DynamoCacheSource,
+    TargetConfig,
+)
 from endpoint_benchmark.transport import StreamingHttpClient, now_ms
 from endpoint_benchmark.version import __version__
 
 
 def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     """Run all configured concurrency levels and write their results."""
+    started_at = datetime.now(UTC).isoformat()
+    target = _effective_target(config)
     output_directory = resolve_output_directory(config.output)
     cases, warnings = load_dataset(config.workload.dataset, config.load)
     preflight = None
@@ -41,6 +48,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     if config.prefix_cache_reset.enabled:
         startup_cache_reset = _reset_prefix_cache(
             config,
+            target,
             config.load.concurrency[0],
             "startup_check",
         )
@@ -52,13 +60,16 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
 
     for concurrency in config.load.concurrency:
         summary, results, metrics, cache_resets, run_warnings = _run_concurrency(
-            config, concurrency, cases
+            config, target, concurrency, cases
         )
         summaries.append(summary)
         endpoint_summaries.extend(
             summarize_endpoints(
                 concurrency=concurrency,
-                endpoints=config.endpoint_pool.endpoints,
+                endpoints=tuple(
+                    _redacted_url(endpoint)
+                    for endpoint in config.endpoint_pool.endpoints
+                ),
                 results=results,
                 duration_s=summary["benchmark_duration_s"],
                 min_success_rate=config.validity.min_success_rate,
@@ -73,7 +84,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
         warnings.extend(run_warnings)
 
     result = BenchmarkResult(
-        run=_run_metadata(config, cases),
+        run=_run_metadata(config, target, cases, started_at),
         summaries=summaries,
         endpoint_summaries=endpoint_summaries,
         requests_by_concurrency=requests_by_concurrency,
@@ -90,6 +101,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
 
 def _run_concurrency(
     config: BenchmarkConfig,
+    target: TargetConfig,
     concurrency: int,
     cases: list[RequestCase],
 ) -> tuple[
@@ -100,19 +112,22 @@ def _run_concurrency(
     list[str],
 ]:
     warnings: list[str] = []
-    client = StreamingHttpClient(config.endpoint_pool.connection_mode)
     if config.load.warmup_prompts:
-        _run_warmup(config, concurrency, cases, client)
-        client.close()
+        warmup_client = StreamingHttpClient(config.endpoint_pool.connection_mode)
+        try:
+            _run_warmup(config, concurrency, cases, warmup_client)
+        finally:
+            warmup_client.close()
 
     cache_resets: list[dict[str, Any]] = []
     if config.prefix_cache_reset.enabled:
-        cache_resets.append(_reset_prefix_cache(config, concurrency, "pre"))
+        cache_resets.append(_reset_prefix_cache(config, target, concurrency, "pre"))
 
     metrics_url = _effective_metrics_url(config)
     metrics_url_source = _metrics_url_source(config)
     metrics_before = _fetch_metrics(metrics_url, warnings, "before")
     router = RoundRobinRouter(config.endpoint_pool.endpoints)
+    client = StreamingHttpClient(config.endpoint_pool.connection_mode)
     benchmark_start_ms = now_ms()
     results: list[RequestResult] = []
     try:
@@ -134,7 +149,7 @@ def _run_concurrency(
     except BaseException:
         client.close()
         if config.prefix_cache_reset.enabled:
-            _reset_prefix_cache(config, concurrency, "post_failure")
+            _reset_prefix_cache(config, target, concurrency, "post_failure")
         raise
     benchmark_end_ms = now_ms()
     client.close()
@@ -145,7 +160,7 @@ def _run_concurrency(
         metrics_url, metrics_url_source, metrics_before, metrics_after, warnings
     )
     if config.prefix_cache_reset.enabled:
-        cache_resets.append(_reset_prefix_cache(config, concurrency, "post"))
+        cache_resets.append(_reset_prefix_cache(config, target, concurrency, "post"))
     duration_s = (benchmark_end_ms - benchmark_start_ms) / 1000.0
     summary = summarize_requests(
         concurrency=concurrency,
@@ -209,6 +224,12 @@ def _execute_case(
     usage = transport.usage or {}
     input_tokens = _optional_int(usage.get("prompt_tokens"))
     output_tokens = _optional_int(usage.get("completion_tokens"))
+    prompt_token_details = usage.get("prompt_tokens_details")
+    cached_input_tokens = (
+        _optional_int(prompt_token_details.get("cached_tokens"))
+        if isinstance(prompt_token_details, dict)
+        else None
+    )
     ttft_ms = (
         transport.first_output_ms - transport.start_ms
         if transport.first_output_ms is not None
@@ -252,6 +273,7 @@ def _execute_case(
         started_at_offset_ms=transport.start_ms - benchmark_start_ms,
         finished_at_offset_ms=transport.end_ms - benchmark_start_ms,
         finish_reason=transport.finish_reason,
+        cached_input_tokens=cached_input_tokens,
         transport_retries=transport.retry_count,
         inter_chunk_latencies_ms=inter_chunk_latencies,
         chunk_arrival_offsets_ms=arrivals,
@@ -316,17 +338,29 @@ def _request_headers(config: BenchmarkConfig) -> dict[str, str]:
     return headers
 
 
+def _effective_target(config: BenchmarkConfig) -> TargetConfig:
+    if config.target is not None:
+        return config.target
+    return TargetConfig(
+        inference_endpoints=config.endpoint_pool.endpoints,
+        headers=tuple(_request_headers(config).items()),
+        cache_sources=(DirectCacheSource(use_inference_endpoints=True),),
+        clear_timeout_s=config.prefix_cache_reset.timeout_s,
+        clear_retry_interval_s=config.prefix_cache_reset.retry_interval_s,
+    )
+
+
 def _reset_prefix_cache(
     config: BenchmarkConfig,
+    target: TargetConfig,
     concurrency: int,
     phase: str,
 ) -> dict[str, Any]:
-    return reset_prefix_caches(
-        endpoints=config.endpoint_pool.endpoints,
-        headers=_request_headers(config),
-        config=config.prefix_cache_reset,
-        concurrency=concurrency,
-        phase=phase,
+    return clear_caches(
+        target,
+        concurrency,
+        phase,
+        reset_external=config.prefix_cache_reset.reset_external,
     )
 
 
@@ -340,7 +374,10 @@ def _fetch_metrics(
     try:
         return fetch_metrics(url)
     except Exception as exc:  # noqa: BLE001
-        warnings.append(f"metrics {phase} fetch failed: {exc}")
+        warnings.append(
+            f"metrics {phase} fetch failed for {_redacted_url(url)}: "
+            f"{type(exc).__name__}"
+        )
         return None
 
 
@@ -356,14 +393,14 @@ def _server_metrics_result(
     if before is None or after is None:
         return {
             "available": False,
-            "url": url,
+            "url": _redacted_url(url),
             "url_source": url_source,
             "accepted_tokens": None,
             "draft_tokens": None,
             "acceptance_rate": None,
             "accepted_tokens_per_position": {},
         }
-    result = calculate_metrics_delta(url, before, after)
+    result = calculate_metrics_delta(_redacted_url(url), before, after)
     result["url_source"] = url_source
     if not result["available"]:
         warnings.append("configured metrics URL lacks supported counters")
@@ -397,11 +434,13 @@ def _optional_int(value: Any) -> int | None:
 
 def _run_metadata(
     config: BenchmarkConfig,
+    target: TargetConfig,
     cases: list[RequestCase],
+    started_at: str,
 ) -> dict[str, Any]:
     return {
         "label": config.output.label,
-        "started_at": datetime.now(UTC).isoformat(),
+        "started_at": started_at,
         "package_version": __version__,
         "schema_version": "1.0",
         "metric_semantics_version": "1.0",
@@ -413,13 +452,17 @@ def _run_metadata(
             "python": platform.python_version(),
             "platform": platform.platform(),
         },
-        "configuration": _redacted_configuration(config),
+        "configuration": _redacted_configuration(config, target),
     }
 
 
-def _redacted_configuration(config: BenchmarkConfig) -> dict[str, Any]:
+def _redacted_configuration(
+    config: BenchmarkConfig, target: TargetConfig
+) -> dict[str, Any]:
     return {
-        "endpoints": list(config.endpoint_pool.endpoints),
+        "endpoints": [
+            _redacted_url(endpoint) for endpoint in config.endpoint_pool.endpoints
+        ],
         "routing": config.endpoint_pool.routing,
         "timeout_s": config.endpoint_pool.timeout_s,
         "connection_mode": config.endpoint_pool.connection_mode,
@@ -431,8 +474,16 @@ def _redacted_configuration(config: BenchmarkConfig) -> dict[str, Any]:
         "shuffle": config.load.shuffle,
         "seed": config.load.seed,
         "warmup_prompts": config.load.warmup_prompts,
-        "metrics_url": config.measurement.metrics_url,
-        "effective_metrics_url": _effective_metrics_url(config),
+        "metrics_url": (
+            _redacted_url(config.measurement.metrics_url)
+            if config.measurement.metrics_url is not None
+            else None
+        ),
+        "effective_metrics_url": (
+            _redacted_url(url)
+            if (url := _effective_metrics_url(config)) is not None
+            else None
+        ),
         "metrics_url_source": _metrics_url_source(config),
         "server_metrics_enabled": config.measurement.server_metrics_enabled,
         "record_chunk_timestamps": config.measurement.record_chunk_timestamps,
@@ -441,11 +492,48 @@ def _redacted_configuration(config: BenchmarkConfig) -> dict[str, Any]:
         "min_success_rate": config.validity.min_success_rate,
         "fail_on_request_error": config.validity.fail_on_request_error,
         "prefix_cache_reset_enabled": config.prefix_cache_reset.enabled,
-        "prefix_cache_reset_timeout_s": config.prefix_cache_reset.timeout_s,
-        "prefix_cache_reset_retry_interval_s": (
-            config.prefix_cache_reset.retry_interval_s
-        ),
+        "prefix_cache_reset_timeout_s": target.clear_timeout_s,
+        "prefix_cache_reset_retry_interval_s": target.clear_retry_interval_s,
         "reset_external_prefix_cache": config.prefix_cache_reset.reset_external,
+        "cache_clear_timeout_s": target.clear_timeout_s,
+        "cache_clear_retry_interval_s": target.clear_retry_interval_s,
+        "cache_sources": [_redacted_source(source) for source in target.cache_sources],
         "output_root": str(config.output.directory),
         "run_name": config.output.run_name,
     }
+
+
+def _redacted_source(source: DirectCacheSource | DynamoCacheSource) -> dict[str, Any]:
+    if isinstance(source, DirectCacheSource):
+        return {
+            "kind": "direct",
+            "endpoints": (
+                [_redacted_url(endpoint) for endpoint in source.endpoints]
+                if source.endpoints is not None
+                else None
+            ),
+            "use_inference_endpoints": source.use_inference_endpoints,
+            "headers": (
+                [name for name, _ in source.headers]
+                if source.headers is not None
+                else None
+            ),
+        }
+    return {
+        "kind": "dynamo",
+        "namespace": source.namespace,
+        "components": list(source.components),
+    }
+
+
+def _redacted_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname or "unknown"
+        port = parsed.port
+    except ValueError:
+        return "<invalid-url>"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = f"{host}:{port}" if port is not None else host
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
