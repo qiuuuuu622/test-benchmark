@@ -44,7 +44,7 @@ uv pip install --python ~/qwen35-benchmark/.venv-benchmark/bin/python -e .
 uv pip install \
   --python ~/qwen35-benchmark/.venv-benchmark/bin/python \
   --no-deps \
-  dist/endpoint_benchmark-0.1.1-py3-none-any.whl
+  dist/endpoint_benchmark-0.2.0-py3-none-any.whl
 ```
 
 ## 2. 下载 Qwen3.5-4B
@@ -112,13 +112,13 @@ curl -fsS -X POST \
   'http://127.0.0.1:8000/reset_prefix_cache?reset_running_requests=false&reset_external=false'
 ```
 
-正常响应应包含：
+vLLM 新版本的正常响应应包含：
 
 ```json
 {"success":true}
 ```
 
-如果返回 404，请确认启动 vLLM 时设置了 `VLLM_SERVER_DEV_MODE=1`。`endpoint-benchmark` 默认会在每个并发档位测量前后清理 prefix cache，并在正式压测前检查该接口。
+vLLM 0.24.0 成功时可能返回空 body；返回 JSON 时必须满足 `success=true`，`success=false` 会按配置重试。如果返回 404，请确认启动 vLLM 时设置了 `VLLM_SERVER_DEV_MODE=1`。`endpoint-benchmark` 默认会在首次 warmup 前检查该接口，并在每个并发档位的 warmup 后和测量后清理 prefix cache。`--isolated-miss` 模式不会调用任何 reset 接口，因此不要求目标服务提供该管理接口。
 
 ## 4. 准备 JSONL 测试数据
 
@@ -184,6 +184,41 @@ cd ~/qwen35-benchmark
 - `--min-success-rate 1.0`：要求每档请求 100% 成功。结果仍会写入磁盘，但不达标时命令返回退出码 3。
 - `--no-server-metrics`：不读取 vLLM `/metrics`，但不会关闭客户端 TTFT、TPOT、E2E、request/s 或 token/s 统计。
 
+### 对比 baseline 与 isolated cache miss
+
+需要在缓存保持开启的情况下验证 cache hit/miss 时，先运行不清理缓存的 baseline：
+
+```bash
+.venv-benchmark/bin/endpoint-benchmark run \
+  --endpoint http://127.0.0.1:8000/v1/chat/completions \
+  --model qwen35-4b \
+  --dataset ./requests.jsonl \
+  --concurrency 1 \
+  --no-reset-prefix-cache \
+  --label baseline
+```
+
+再对同一 endpoint 运行 isolated 组：
+
+```bash
+.venv-benchmark/bin/endpoint-benchmark run \
+  --endpoint http://127.0.0.1:8000/v1/chat/completions \
+  --model qwen35-4b \
+  --dataset ./requests.jsonl \
+  --concurrency 1 \
+  --isolated-miss \
+  --label isolated
+```
+
+`--isolated-miss` 为每个 warmup 和正式逻辑请求生成独立 identity，并自动跳过 startup、pre、post 和失败清理。它不能与显式 reset、reset timeout 或 reset interval 参数同时使用。Dynamo 只作为普通 OpenAI-compatible HTTP endpoint 使用，客户端不会执行 runtime discovery、probe 或 Dynamo cache clear。
+
+文本请求会在最早可控的 system 或 user 文本前增加 identity marker。图片请求必须直接使用标准 `messages` content part，并选择一种策略：
+
+- vLLM：在图片 part 的顶层 `uuid` 中放置 `{isolated_miss_id}`，URL 保持不变；
+- SGLang：在图片 URL 中放置 `{isolated_miss_id}`，且不提供 `uuid`。
+
+同一数据集不能混用两种图片策略。不支持的媒体、缺失或重复占位符会在任何网络请求前报错。连接复用失败触发的安全重试会复用完全相同的请求体。
+
 输出目录会自动带时间戳，例如：
 
 ```text
@@ -198,7 +233,7 @@ results/qwen35-4b-single-gpu_20260806_120000/
 - `endpoint_summary.json`：JSON 格式的 endpoint 诊断结果。
 - `requests.jsonl`：每条请求的成功状态、endpoint、TTFT、TPOT 和 E2E 等原始结果。
 - `preflight.json`：启用 tokenize preflight 时的数据 token 分布和上下文检查结果。
-- `cache_resets.json`：每次 prefix-cache 清理的审计记录。
+- `cache_resets.json`：每次 prefix-cache 清理的审计记录；isolated 模式为空。
 - `run.json`：完整运行配置和数据集告警。
 
 ## 6. 多个 Endpoint 的 round-robin 示例

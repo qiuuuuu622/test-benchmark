@@ -16,7 +16,7 @@ Torch, CUDA, NVIDIA, or vLLM environment.
 - A single endpoint is one complete request URL.
 - An endpoint pool contains one or more equivalent endpoints.
 - A benchmark run sends one workload to one endpoint pool.
-- Multiple endpoints use a routing policy; v0.1 supports round-robin.
+- Multiple endpoints use a routing policy; package 0.2.0 supports round-robin.
 - `model` belongs to the workload payload, not the target abstraction.
 - The client does not load, discover, or inspect models.
 
@@ -77,10 +77,12 @@ The benchmark client owns:
 
 - dataset loading and normalization;
 - request construction;
+- optional request-level cache-identity isolation;
 - load scheduling and endpoint routing;
 - HTTP/SSE transport;
 - client-observed timing;
 - optional server metrics collection and counter-delta calculation;
+- the simple direct vLLM prefix-cache reset lifecycle;
 - request-level results, summaries, and serialization.
 
 It does not own:
@@ -88,7 +90,7 @@ It does not own:
 - model loading or tokenizer installation;
 - vLLM lifecycle management;
 - GPU, CUDA, or NVML discovery;
-- server cache reset or mutation;
+- runtime discovery, backend probing, or Dynamo cache management;
 - load balancer configuration;
 - correctness or quality evaluation of generated text.
 
@@ -99,6 +101,7 @@ CLI
  └── Configuration loader and validator
       └── Benchmark runner
            ├── Dataset loader and normalizer
+           ├── Isolated miss validator and message transformer
            ├── Load scheduler
            │    └── Endpoint pool router
            ├── Streaming HTTP client
@@ -124,6 +127,7 @@ Configuration is split by responsibility:
 - `MeasurementConfig`: timing details, the derived or explicit metrics URL, and
   its disable switch;
 - `PrefixCacheResetConfig`: mandatory-by-default per-level pre/post cache reset;
+- `isolated_miss`: request-level identity isolation that disables reset;
 - `OutputConfig`: result location and serialization policy.
 
 Frozen dataclasses are preferred so a running benchmark cannot silently mutate
@@ -143,9 +147,17 @@ explicit CLI override > request-row value > server default
 
 A configured output-token cap is always applied as a safety ceiling.
 
-### 4.4 Load scheduler
+### 4.4 Isolated miss transformer
 
-v0.1 uses closed-loop concurrency: each worker begins its next request after its
+Before any network I/O, isolated mode validates every case and then rewrites a
+deep copy of each logical request. Text receives one random identity marker;
+vLLM image UUIDs or SGLang image URLs receive media-specific identities. A
+dataset may use only one image strategy. The module does not probe runtimes,
+discover Dynamo workers, or send `cache_salt`.
+
+### 4.5 Load scheduler
+
+The current implementation uses closed-loop concurrency: each worker begins its next request after its
 previous request completes. A concurrency value is the total concurrency for the
 whole endpoint pool, not concurrency per endpoint.
 
@@ -157,21 +169,23 @@ and formal timing. After all requests complete, metrics-after is collected befor
 a second reset. Every reset must succeed before advancing to the next level.
 Before the first warmup, a startup reset verifies that every engine exposes the
 development management endpoint and fails closed with a dev-mode diagnostic.
+Isolated mode skips every reset phase; `--no-reset-prefix-cache` provides the
+cache-enabled baseline for A/B runs.
 
 The configuration model should allow a future open-loop scheduler without
 changing endpoint, workload, measurement, or result contracts. Future scheduling
 may support request rate, maximum concurrency, and Poisson or constant arrivals.
 
-### 4.5 Endpoint pool router
+### 4.6 Endpoint pool router
 
-v0.1 supports thread-safe round-robin routing. Routing records the number of
+Package 0.2.0 supports thread-safe round-robin routing. Routing records the number of
 requests dispatched to each endpoint for audit purposes, but the default
 performance report remains endpoint-pool-wide.
 
 Routing only selects request endpoints. Every request result is added directly
 to the same measurement pool, regardless of which endpoint served it.
 
-### 4.6 Streaming HTTP client
+### 4.7 Streaming HTTP client
 
 The client sends OpenAI-compatible streaming requests and consumes SSE records as
 they arrive. Each worker may reuse its own HTTP connection. Connection reuse is
@@ -179,9 +193,10 @@ the default; a new-connection mode may be selected when connection setup should
 be part of the workload.
 
 The transport reports protocol observations and errors but does not calculate
-summary statistics.
+summary statistics. A stale reused connection may be retried only before a
+response exists, using the exact same encoded request body.
 
-### 4.7 Stream recorder
+### 4.8 Stream recorder
 
 The recorder captures:
 
@@ -195,19 +210,20 @@ The recorder captures:
 TTFT, end-to-end latency, and request-level TPOT are derived from these
 observations according to the versioned metric definitions.
 
-### 4.8 Server metrics collector
+### 4.9 Server metrics collector
 
 Unless disabled, the collector reads one logical Prometheus metrics URL before
 and after each formal concurrency run. It defaults to `/metrics` on the first
 endpoint origin and is expected to expose the desired service-pool-wide counters.
-It stores raw before/after snapshots for auditability.
+It compares the before/after snapshots in memory and persists the normalized
+counter deltas.
 
 The collector calculates deltas for known speculative-decoding counters. It does
 not combine per-machine sources or blindly transform arbitrary gauges. Cluster
 metrics aggregation, when needed, belongs to Prometheus or another service-side
 metrics system behind the configured URL.
 
-### 4.9 Result aggregator
+### 4.10 Result aggregator
 
 The aggregator calculates endpoint-pool-wide counts, throughput, token-length
 distributions, latency distributions, and optional server counter deltas. Every
@@ -220,33 +236,36 @@ pyproject.toml
 src/
   endpoint_benchmark/
     __init__.py
-    cli.py
-    config.py
-    dataset.py
-    models.py
-    routing.py
-    scheduler.py
-    transport.py
-    timing.py
-    server_metrics.py
-    cache_control.py
+    __main__.py
     aggregation.py
+    cache_control.py
+    cli.py
+    dataset.py
+    isolated_miss.py
+    models.py
     output.py
+    preflight.py
+    routing.py
+    runner.py
+    server_metrics.py
+    transport.py
+    version.py
 tests/
+  test_cli.py
   test_dataset.py
+  test_isolated_miss.py
+  test_preflight.py
   test_routing.py
-  test_stream_timing.py
   test_server_metrics.py
   test_cache_control.py
   test_aggregation.py
   test_runner.py
+  test_transport.py
 ```
 
-The final distribution name and import package name remain to be selected.
+## 6. Package 0.2.0 scope
 
-## 6. v0.1 scope
-
-v0.1 includes:
+Package 0.2.0 includes:
 
 - one endpoint pool per run;
 - one or more OpenAI-compatible chat-completion URLs;
@@ -255,19 +274,21 @@ v0.1 includes:
 - JSONL datasets;
 - closed-loop concurrency levels;
 - warmup requests;
+- simple direct vLLM prefix-cache reset;
+- request-level isolated cache identities for text, vLLM images, and SGLang images;
 - zero-runtime-dependency HTTP execution;
 - request-level JSONL and aggregate JSON/CSV output;
 - endpoint-pool throughput, TTFT, TPOT, and E2E latency;
 - speculative-decoding deltas from one derived or explicit metrics URL.
 
-v0.1 excludes:
+Package 0.2.0 excludes:
 
 - open-loop request-rate scheduling;
 - distributed benchmark generators;
 - local tokenization;
 - strict inter-token latency;
 - GPU and power monitoring;
-- automatic cache resets;
+- target files, runtime discovery, backend probes, and Dynamo runtime cache clear;
 - model quality evaluation;
 - a web UI.
 
@@ -287,6 +308,8 @@ Required behavioral coverage includes:
 - total concurrency applies to the endpoint pool;
 - all endpoints contribute directly to one request measurement pool;
 - the enabled metrics URL is sampled once before and after the workload;
+- isolated warmup and measured requests use unique identities and never reset caches;
+- stale-connection retries reuse the same encoded request body;
 - HTTP, timeout, truncated-stream, and malformed-SSE errors are classified.
 
 ## 8. Evolution rules
@@ -296,5 +319,5 @@ Required behavioral coverage includes:
 - Metric formula changes require a new metric-semantics version.
 - Historical aliases stay in the dataset adapter rather than leaking into core
   models.
-- Backend-specific request extensions belong in an adapter or validated
-  `extra_body`, not in the endpoint abstraction.
+- Backend-specific request extensions belong in the isolated message transformer
+  or validated `extra_body`, not in the endpoint abstraction.

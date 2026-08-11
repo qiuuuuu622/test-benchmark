@@ -13,7 +13,7 @@
 - 单个 endpoint 是一个完整请求 URL。
 - endpoint pool 包含一个或多个功能等价的 endpoint。
 - 一次 benchmark run 对一个 endpoint pool 施加一份 workload。
-- 多 endpoint 通过路由策略分发；v0.1 支持 round-robin。
+- 多 endpoint 通过路由策略分发；package 0.2.0 支持 round-robin。
 - `model` 属于 workload payload，不属于测试目标抽象。
 - 客户端不加载、发现或检查模型。
 
@@ -60,10 +60,12 @@ chunk 时间戳默认不保存，避免结果文件过大。启用后记录的�
 
 - 数据集读取与规范化；
 - 请求构造；
+- 可选的请求级 cache identity 隔离；
 - 负载调度和 endpoint 路由；
 - HTTP/SSE 传输；
 - 客户端计时；
 - 可选服务端 metrics 采集和 counter delta 计算；
+- 简单 direct vLLM prefix-cache reset lifecycle；
 - 请求级结果、汇总和序列化。
 
 客户端不负责：
@@ -71,7 +73,7 @@ chunk 时间戳默认不保存，避免结果文件过大。启用后记录的�
 - 加载模型或安装 tokenizer；
 - 管理 vLLM 生命周期；
 - 探测 GPU、CUDA 或 NVML；
-- 重置服务端 cache 或改变服务端状态；
+- runtime discovery、backend probe 或 Dynamo cache 管理；
 - 配置负载均衡器；
 - 评价生成内容的正确性或质量。
 
@@ -82,6 +84,7 @@ CLI
  └── 配置加载与校验
       └── Benchmark Runner
            ├── 数据集加载与规范化
+           ├── Isolated miss 校验与 messages 改写
            ├── Load Scheduler
            │    └── Endpoint Pool Router
            ├── Streaming HTTP Client
@@ -104,6 +107,7 @@ CLI 只负责解析参数、展示进度和结果表格，不实现压测逻辑�
 - `LoadConfig`：并发、请求数、顺序、随机种子和 warmup；
 - `MeasurementConfig`：计时细节、自动推导或显式 metrics URL 及关闭开关；
 - `PrefixCacheResetConfig`：默认启用的每档 pre/post prefix cache reset；
+- `isolated_miss`：请求级 identity 隔离，同时禁用 reset；
 - `OutputConfig`：结果路径和序列化策略。
 
 配置优先使用 frozen dataclass，防止运行期间静默改变有效配置。
@@ -120,9 +124,13 @@ CLI 显式覆盖 > 数据集单请求字段 > 省略并使用服务端默认值
 
 输出 token cap 始终作为最终安全上限。
 
-### 4.4 负载调度器
+### 4.4 Isolated miss 改写器
 
-v0.1 使用 closed-loop concurrency：每个 worker 完成前一个请求后再发下一个请求。并发值表示整个 endpoint pool 的总并发，而不是每个 endpoint 的并发。
+isolated 模式在任何网络 I/O 前校验全部 case，并为每个逻辑请求改写 `messages` 的深拷贝。文本获得一个随机 identity marker；vLLM 图片 UUID 或 SGLang 图片 URL 获得媒体 identity。同一数据集只能使用一种图片策略。该模块不执行 runtime probe、Dynamo discovery，也不发送 `cache_salt`。
+
+### 4.5 负载调度器
+
+当前实现使用 closed-loop concurrency：每个 worker 完成前一个请求后再发下一个请求。并发值表示整个 endpoint pool 的总并发，而不是每个 endpoint 的并发。
 
 不同并发档位顺序执行并分别生成 summary。warmup 在正式测量前运行，不计入结果。
 
@@ -130,21 +138,23 @@ v0.1 使用 closed-loop concurrency：每个 worker 完成前一个请求后再�
 
 第一次 warmup 之前先执行 startup reset，确认全部引擎都暴露开发管理接口；未启用时明确提示 dev mode 并 fail-closed。
 
+isolated 模式跳过全部 reset 阶段；A/B 的 cache-enabled baseline 使用 `--no-reset-prefix-cache`。
+
 配置模型应允许未来加入 open-loop scheduler，而不改变 endpoint、workload、measurement 和 result 契约。未来可支持 request rate、最大并发以及 Poisson/constant 到达分布。
 
-### 4.5 Endpoint Pool Router
+### 4.6 Endpoint Pool Router
 
-v0.1 提供线程安全且确定性的 round-robin 路由。记录每个 endpoint 的分发请求数用于审计，但默认性能报告只展示 endpoint pool 总体结果。
+package 0.2.0 提供线程安全且确定性的 round-robin 路由。记录每个 endpoint 的分发请求数用于审计，但默认性能报告只展示 endpoint pool 总体结果。
 
 路由只负责选择请求 endpoint。无论请求由哪个 endpoint 服务，其结果都直接进入同一个 measurement pool。
 
-### 4.6 Streaming HTTP Client
+### 4.7 Streaming HTTP Client
 
 客户端发送 OpenAI-compatible 流式请求，并在 SSE record 到达时立即消费。默认每个 worker 复用自己的 HTTP 连接；可选 new-connection 模式用于将建连计入 workload。
 
-传输层只报告协议观测和错误，不负责计算汇总统计。
+传输层只报告协议观测和错误，不负责计算汇总统计。复用连接失效时只能在收到 response 前重试，并复用完全相同的编码请求体。
 
-### 4.7 Stream Recorder
+### 4.8 Stream Recorder
 
 记录：
 
@@ -157,13 +167,13 @@ v0.1 提供线程安全且确定性的 round-robin 路由。记录每个 endpoin
 
 TTFT、E2E latency 和请求级 TPOT 均从这些观测按照版本化公式派生。
 
-### 4.8 Server Metrics Collector
+### 4.9 Server Metrics Collector
 
-除非显式关闭，每个正式并发档位开始前和结束后读取一个逻辑 Prometheus metrics URL。默认从第一个 endpoint 的 origin 推导 `/metrics`；该 URL 应提供所需的服务池总体 counter，并保存原始 before/after 快照以便审计。
+除非显式关闭，每个正式并发档位开始前和结束后读取一个逻辑 Prometheus metrics URL。默认从第一个 endpoint 的 origin 推导 `/metrics`；该 URL 应提供所需的服务池总体 counter。Collector 在内存中比较 before/after，并把规范化 counter delta 写入结果。
 
 Collector 计算已知 speculative decoding counter 的 delta，但不合并各机器 source，也不盲目处理任意 gauge。需要集群级指标聚合时，应由配置 URL 背后的 Prometheus 或其他服务端指标系统完成。
 
-### 4.9 Result Aggregator
+### 4.10 Result Aggregator
 
 基于统一 measurement pool 计算总体完成数、吞吐、token 长度分布、延迟分布和可选服务端 counter delta。所有可选分布都必须携带样本数。
 
@@ -174,33 +184,36 @@ pyproject.toml
 src/
   endpoint_benchmark/
     __init__.py
-    cli.py
-    config.py
-    dataset.py
-    models.py
-    routing.py
-    scheduler.py
-    transport.py
-    timing.py
-    server_metrics.py
-    cache_control.py
+    __main__.py
     aggregation.py
+    cache_control.py
+    cli.py
+    dataset.py
+    isolated_miss.py
+    models.py
     output.py
+    preflight.py
+    routing.py
+    runner.py
+    server_metrics.py
+    transport.py
+    version.py
 tests/
+  test_cli.py
   test_dataset.py
+  test_isolated_miss.py
+  test_preflight.py
   test_routing.py
-  test_stream_timing.py
   test_server_metrics.py
   test_cache_control.py
   test_aggregation.py
   test_runner.py
+  test_transport.py
 ```
 
-最终 distribution name 和 import package name 尚待确定。
+## 6. Package 0.2.0 范围
 
-## 6. v0.1 范围
-
-包含：
+package 0.2.0 包含：
 
 - 每次 run 使用一个 endpoint pool；
 - 一个或多个 OpenAI-compatible chat-completion URL；
@@ -209,19 +222,21 @@ tests/
 - JSONL 数据集；
 - closed-loop 并发档位；
 - warmup；
+- 简单 direct vLLM prefix-cache reset；
+- 文本、vLLM 图片和 SGLang 图片的请求级 isolated cache identity；
 - 零运行时依赖 HTTP 客户端；
 - 请求级 JSONL 和聚合 JSON/CSV；
 - endpoint pool 总体 throughput、TTFT、TPOT、E2E latency；
 - 从自动推导或显式指定的逻辑 metrics URL 计算 speculative decoding delta。
 
-不包含：
+package 0.2.0 不包含：
 
 - open-loop request-rate 调度；
 - 分布式压测发生器；
 - 本地 tokenization；
 - 严格 ITL；
 - GPU、功耗监控；
-- 自动清理 cache；
+- Target 文件、runtime discovery、backend probe 和 Dynamo runtime cache clear；
 - 模型质量评测；
 - Web UI。
 
@@ -238,6 +253,8 @@ tests/
 - 并发是 endpoint pool 总并发；
 - 所有 endpoint 的请求结果直接进入同一个 measurement pool；
 - 启用的 metrics URL 在 workload 前后各采集一次；
+- isolated warmup 和正式请求 identity 唯一且不执行 reset；
+- stale connection 重试复用同一编码请求体；
 - 正确分类 HTTP、timeout、截断流和非法 SSE 错误。
 
 ## 8. 演进规则
@@ -246,4 +263,4 @@ tests/
 - 新增可选字段应保持向后兼容。
 - 指标公式变化必须提升 metric semantics version。
 - 历史字段别名只存在于 dataset adapter。
-- 后端专用参数放在 adapter 或经校验的 `extra_body` 中，不能污染 endpoint 抽象。
+- 后端专用请求扩展放在 isolated messages 改写器或经校验的 `extra_body` 中，不能污染 endpoint 抽象。

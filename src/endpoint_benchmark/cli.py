@@ -85,12 +85,17 @@ def _parser() -> argparse.ArgumentParser:
         default=True,
     )
     run.add_argument(
+        "--isolated-miss",
+        action="store_true",
+        help="give every logical request a unique text/media cache identity",
+    )
+    run.add_argument(
         "--reset-prefix-cache",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=None,
     )
-    run.add_argument("--prefix-cache-reset-timeout", type=float, default=60.0)
-    run.add_argument("--prefix-cache-reset-interval", type=float, default=0.5)
+    run.add_argument("--prefix-cache-reset-timeout", type=float)
+    run.add_argument("--prefix-cache-reset-interval", type=float)
     run.add_argument("--reset-external-prefix-cache", action="store_true")
     run.add_argument("--output-dir", type=Path, default=Path("benchmark_results"))
     run.add_argument("--label", default="benchmark")
@@ -100,6 +105,21 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
+    if args.isolated_miss:
+        conflicts = []
+        if args.reset_prefix_cache is True:
+            conflicts.append("--reset-prefix-cache")
+        if args.reset_external_prefix_cache:
+            conflicts.append("--reset-external-prefix-cache")
+        if args.prefix_cache_reset_timeout is not None:
+            conflicts.append("--prefix-cache-reset-timeout")
+        if args.prefix_cache_reset_interval is not None:
+            conflicts.append("--prefix-cache-reset-interval")
+        if conflicts:
+            raise ValueError(
+                "--isolated-miss cannot be combined with " + ", ".join(conflicts)
+            )
+
     return BenchmarkConfig(
         endpoint_pool=EndpointPoolConfig(
             endpoints=tuple(args.endpoint),
@@ -138,10 +158,21 @@ def _config_from_args(args: argparse.Namespace) -> BenchmarkConfig:
             min_success_rate=args.min_success_rate,
             fail_on_request_error=args.fail_on_request_error,
         ),
+        isolated_miss=args.isolated_miss,
         prefix_cache_reset=PrefixCacheResetConfig(
-            enabled=args.reset_prefix_cache,
-            timeout_s=args.prefix_cache_reset_timeout,
-            retry_interval_s=args.prefix_cache_reset_interval,
+            enabled=(
+                False if args.isolated_miss else args.reset_prefix_cache is not False
+            ),
+            timeout_s=(
+                args.prefix_cache_reset_timeout
+                if args.prefix_cache_reset_timeout is not None
+                else 60.0
+            ),
+            retry_interval_s=(
+                args.prefix_cache_reset_interval
+                if args.prefix_cache_reset_interval is not None
+                else 0.5
+            ),
             reset_external=args.reset_external_prefix_cache,
         ),
         output=OutputConfig(

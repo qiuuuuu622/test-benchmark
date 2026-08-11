@@ -8,6 +8,11 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from endpoint_benchmark.aggregation import distribution
+from endpoint_benchmark.isolated_miss import (
+    isolate_messages,
+    new_identity,
+    validate_cases,
+)
 from endpoint_benchmark.models import BenchmarkConfig, RequestCase
 
 
@@ -23,9 +28,15 @@ def run_token_preflight(
     violations: list[dict[str, Any]] = []
     observed_model_limits: list[int] = []
 
+    if config.isolated_miss:
+        validate_cases(cases)
+
     for index, case in enumerate(cases):
+        messages = case.messages
+        if config.isolated_miss:
+            messages, _ = isolate_messages(messages, new_identity())
         payload: dict[str, Any] = {
-            "messages": case.messages,
+            "messages": messages,
             "add_generation_prompt": True,
         }
         model = config.workload.model or case.request.get("model")

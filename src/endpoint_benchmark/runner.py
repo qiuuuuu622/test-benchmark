@@ -12,6 +12,11 @@ from urllib.parse import urlsplit, urlunsplit
 from endpoint_benchmark.aggregation import summarize_endpoints, summarize_requests
 from endpoint_benchmark.cache_control import reset_prefix_caches
 from endpoint_benchmark.dataset import load_dataset
+from endpoint_benchmark.isolated_miss import (
+    isolate_messages,
+    new_identity,
+    validate_cases,
+)
 from endpoint_benchmark.models import (
     BenchmarkConfig,
     BenchmarkResult,
@@ -40,11 +45,12 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     output_directory.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {output_directory.resolve()}", flush=True)
     cases, warnings = load_dataset(config.workload.dataset, config.load)
+    media_strategy = validate_cases(cases) if config.isolated_miss else None
     preflight = None
     if config.preflight.tokenize:
         preflight = run_token_preflight(config, cases, _request_headers(config))
     startup_cache_reset = None
-    if config.prefix_cache_reset.enabled:
+    if _cache_reset_enabled(config):
         startup_cache_reset = _reset_prefix_cache(
             config,
             config.load.concurrency[0],
@@ -80,7 +86,7 @@ def run_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
         warnings.extend(run_warnings)
 
     result = BenchmarkResult(
-        run=_run_metadata(config, cases),
+        run=_run_metadata(config, cases, media_strategy),
         summaries=summaries,
         endpoint_summaries=endpoint_summaries,
         requests_by_concurrency=requests_by_concurrency,
@@ -113,7 +119,7 @@ def _run_concurrency(
         client.close()
 
     cache_resets: list[dict[str, Any]] = []
-    if config.prefix_cache_reset.enabled:
+    if _cache_reset_enabled(config):
         cache_resets.append(_reset_prefix_cache(config, concurrency, "pre"))
 
     metrics_url = _effective_metrics_url(config)
@@ -140,7 +146,7 @@ def _run_concurrency(
                 results.append(future.result())
     except BaseException:
         client.close()
-        if config.prefix_cache_reset.enabled:
+        if _cache_reset_enabled(config):
             _reset_prefix_cache(config, concurrency, "post_failure")
         raise
     benchmark_end_ms = now_ms()
@@ -151,7 +157,7 @@ def _run_concurrency(
     server_metrics = _server_metrics_result(
         metrics_url, metrics_url_source, metrics_before, metrics_after, warnings
     )
-    if config.prefix_cache_reset.enabled:
+    if _cache_reset_enabled(config):
         cache_resets.append(_reset_prefix_cache(config, concurrency, "post"))
     duration_s = (benchmark_end_ms - benchmark_start_ms) / 1000.0
     summary = summarize_requests(
@@ -268,7 +274,10 @@ def _execute_case(
 def _build_payload(config: BenchmarkConfig, case: RequestCase) -> dict[str, Any]:
     row = dict(case.request)
     payload = dict(config.workload.extra_body)
-    payload["messages"] = case.messages
+    messages = case.messages
+    if config.isolated_miss:
+        messages, _ = isolate_messages(messages, new_identity())
+    payload["messages"] = messages
     payload["stream"] = True
     payload["stream_options"] = {"include_usage": True}
 
@@ -335,6 +344,10 @@ def _reset_prefix_cache(
         concurrency=concurrency,
         phase=phase,
     )
+
+
+def _cache_reset_enabled(config: BenchmarkConfig) -> bool:
+    return config.prefix_cache_reset.enabled and not config.isolated_miss
 
 
 def _fetch_metrics(
@@ -405,8 +418,9 @@ def _optional_int(value: Any) -> int | None:
 def _run_metadata(
     config: BenchmarkConfig,
     cases: list[RequestCase],
+    media_strategy: str | None = None,
 ) -> dict[str, Any]:
-    return {
+    metadata = {
         "label": config.output.label,
         "started_at": datetime.now(UTC).isoformat(),
         "package_version": __version__,
@@ -422,6 +436,17 @@ def _run_metadata(
         },
         "configuration": _redacted_configuration(config),
     }
+    if config.isolated_miss:
+        metadata.update(
+            {
+                "cache_mode": "isolated_miss",
+                "text_strategy": "system_prefix",
+                "media_strategy": (
+                    validate_cases(cases) if media_strategy is None else media_strategy
+                ),
+            }
+        )
+    return metadata
 
 
 def _redacted_configuration(config: BenchmarkConfig) -> dict[str, Any]:
@@ -447,7 +472,7 @@ def _redacted_configuration(config: BenchmarkConfig) -> dict[str, Any]:
         "preflight_max_model_len": config.preflight.max_model_len,
         "min_success_rate": config.validity.min_success_rate,
         "fail_on_request_error": config.validity.fail_on_request_error,
-        "prefix_cache_reset_enabled": config.prefix_cache_reset.enabled,
+        "prefix_cache_reset_enabled": _cache_reset_enabled(config),
         "prefix_cache_reset_timeout_s": config.prefix_cache_reset.timeout_s,
         "prefix_cache_reset_retry_interval_s": (
             config.prefix_cache_reset.retry_interval_s
